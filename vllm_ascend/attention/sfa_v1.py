@@ -1763,12 +1763,17 @@ class AscendSFAImpl(MLAAttentionImpl):
                 )
 
             if self.enable_dsa_cp:
-                assert k_pe is not None
-                assert k_nope is not None
                 async_op = self.enable_dsa_cp_with_layer_shard or full_gather_o_proj_enabled
                 kv_ag_handles = []
                 # support all_gather kv async for communication calculation overlap
-                if self.enable_sparse_sfa_c8:
+                if self.use_tq_latent:
+                    # TQ fuses latent+rope+scale into a single packed slot (k_nope == _comb);
+                    # gather it whole instead of the separate k_nope/k_pe/knope_scale pieces.
+                    assert k_nope is not None
+                    fused_kv_parts = [k_nope.view(-1, k_nope.shape[-1])]
+                elif self.enable_sparse_sfa_c8:
+                    assert k_pe is not None
+                    assert k_nope is not None
                     assert knope_scale is not None
                     fused_kv_parts = [
                         k_nope.view(-1, k_nope.shape[-1]),
@@ -1776,6 +1781,8 @@ class AscendSFAImpl(MLAAttentionImpl):
                         knope_scale.view(-1, knope_scale.shape[-1]),
                     ]
                 else:
+                    assert k_pe is not None
+                    assert k_nope is not None
                     fused_kv_parts = [
                         k_pe.view(-1, k_pe.shape[-1]),
                         k_nope.view(-1, k_nope.shape[-1]),
