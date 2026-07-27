@@ -1757,7 +1757,7 @@ void store_kv_block(
 } 
 
 
-at::Tensor turboquant_sparse_flash_attention_meta(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices,
     const c10::optional<at::Tensor> &key_dequant_scale,
@@ -1768,12 +1768,24 @@ at::Tensor turboquant_sparse_flash_attention_meta(
     double scale_value, int64_t key_quant_mode, int64_t value_quant_mode,
     int64_t sparse_block_size, c10::string_view layout_query, c10::string_view layout_kv,
     int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t attention_mode,
-    int64_t quant_scale_repo_mode, int64_t tile_size, int64_t rope_head_dim)
+    int64_t quant_scale_repo_mode, int64_t tile_size, int64_t rope_head_dim,
+    bool return_softmax_lse)
 {
     auto query_shape = query.sizes();
     at::Tensor output = at::empty(
         {query_shape[0], query_shape[1], query_shape[2] - rope_head_dim}, query.options().dtype(query.dtype()));
-    return output;
+    std::string layout_kv_str(layout_kv);
+    at::SmallVector<int64_t, 8> softmax_size;
+    if (return_softmax_lse) {
+        const int64_t kv_head_dim =
+            layout_kv_str == "PA_BSND" ? key.size(2) : key.size(1);
+        softmax_size = {kv_head_dim, query.size(0), query.size(1) / kv_head_dim};
+    } else {
+        softmax_size = {0};
+    }
+    at::Tensor softmax_max = at::empty(softmax_size, query.options().dtype(at::kFloat));
+    at::Tensor softmax_sum = at::empty(softmax_size, query.options().dtype(at::kFloat));
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor>(output, softmax_max, softmax_sum);
 }
 
 at::Tensor turbo_quant_compress_latent_meta(const at::Tensor &latent, const at::Tensor &centroids)

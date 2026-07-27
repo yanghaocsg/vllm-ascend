@@ -15,6 +15,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.context_parallel.common_cp import AscendPCPMetadata
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
+    _tq_store,
     AscendSFAMetadata,
     AscendSFAMetadataBuilder,
     DCPContext,
@@ -1230,6 +1231,70 @@ class AscendSFADCPImpl(AscendSFAImpl):
         assert attn_metadata.dcp_context is not None, "DCP SFA requires attn_metadata.dcp_context."
         attn_metadata.dcp_context.gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
 
+    def _execute_tq_dcp_sfa(
+        self,
+        ql_nope,
+        q_pe,
+        kv_cache,
+        topk_indices,
+        attn_metadata,
+        actual_seq_lengths_query,
+        actual_seq_lengths_key,
+    ):
+        # TQ4 packs latent+rope+scale into kv_cache[0]; the fused turbo op reads
+        # it directly. DeviceOperator would mis-route by the bf16 base dtype, so
+        # bypass it here (mirrors sfa_v1.AscendSFAImpl for the non-DCP case) and
+        # additionally expose softmax LSE so decode can merge across CP ranks.
+        dcp_context = attn_metadata.dcp_context
+        _ts = _tq_store()
+        _MAX = 9223372036854775807
+        if self._has_prefill(attn_metadata):
+            gather_context = dcp_context.gather_context
+            dcp_context.gather_context = None
+            if gather_context is None:
+                self._record_dcp_kv_gather_context(kv_cache, attn_metadata)
+                gather_context = dcp_context.gather_context
+                dcp_context.gather_context = None
+            assert gather_context is not None
+            gathered_kv_cache = self._finish_dcp_gather(gather_context)
+            block_table = dcp_context.kv_gather_block_table
+            assert block_table is not None
+            _q = torch.cat(
+                [_ts.had_fwd(ql_nope, head_dim=self.kv_lora_rank), q_pe], dim=-1
+            ).contiguous()
+            _kv = gathered_kv_cache[0]
+            _ao, _, _ = torch.ops._C_ascend.turboquant_sparse_flash_attention(
+                _q, _kv, _kv, topk_indices, None, None, block_table,
+                actual_seq_lengths_query, actual_seq_lengths_key,
+                float(self.scale), self.tq_key_quant_mode, self.tq_value_quant_mode, 1, "TND", "PA_BSND",
+                3, _MAX, _MAX, 2, 1, self.tq_tile_size, self.qk_rope_head_dim, False)
+            return _ts.had_inv(_ao, head_dim=self.kv_lora_rank)
+
+        gather_context = dcp_context.gather_context
+        dcp_context.gather_context = None
+        if gather_context is None:
+            gather_context = self._start_dcp_query_gather(ql_nope, q_pe)
+        if self.enable_dsa_cp:
+            actual_seq_lengths_query = attn_metadata.cum_query_lens
+            topk_indices = self.dcp_group.all_gather(topk_indices.contiguous(), dim=0)
+        topk_indices = self._remap_sparse_indices(topk_indices)
+        ql_nope, q_pe = self._finish_dcp_gather(gather_context)
+        _q = torch.cat(
+            [_ts.had_fwd(ql_nope, head_dim=self.kv_lora_rank), q_pe], dim=-1
+        ).contiguous()
+        _kv = kv_cache[0]
+        _ao, _smax, _ssum = torch.ops._C_ascend.turboquant_sparse_flash_attention(
+            _q, _kv, _kv, topk_indices, None, None, dcp_context.block_table,
+            actual_seq_lengths_query, dcp_context.seq_lens,
+            float(self.scale), self.tq_key_quant_mode, self.tq_value_quant_mode, 1, "TND", "PA_BSND",
+            0, _MAX, _MAX, 2, 1, self.tq_tile_size, self.qk_rope_head_dim, True)
+        softmax_lse = _smax.to(torch.float32) + torch.log(_ssum.to(torch.float32))
+        softmax_lse = softmax_lse.permute(1, 0, 2).reshape(softmax_lse.shape[1], -1, 1)
+        output_dtype = _ao.dtype
+        output = self._merge_dcp_outputs(_ao, softmax_lse, attn_metadata.dsa_cp_context)
+        output = _ts.had_inv(output, head_dim=self.kv_lora_rank)
+        return output.to(output_dtype)
+
     def _execute_sparse_flash_attention_process(
         self,
         ql_nope,
@@ -1243,6 +1308,11 @@ class AscendSFADCPImpl(AscendSFAImpl):
         assert attn_metadata.dcp_context is not None, "DCP SFA requires attn_metadata.dcp_context."
         assert self.dcp_group is not None, "DCP SFA requires dcp_group when dcp_size > 1."
         dcp_context = attn_metadata.dcp_context
+        if self.use_tq_latent:
+            return self._execute_tq_dcp_sfa(
+                ql_nope, q_pe, kv_cache, topk_indices, attn_metadata,
+                actual_seq_lengths_query, actual_seq_lengths_key,
+            )
         if self._has_prefill(attn_metadata):
             gather_context = dcp_context.gather_context
             dcp_context.gather_context = None

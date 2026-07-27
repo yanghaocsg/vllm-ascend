@@ -294,6 +294,7 @@ void TQSFAMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_tileSize(qsfaInfo_->tileSize);
     tilingData_.baseParams.set_isActualLenDimsNull(qsfaInfo_->actualQSeqLenFlag ? 0U : 1U);
     tilingData_.baseParams.set_isActualLenDimsKVNull(qsfaInfo_->actualSeqLenFlag ? 0U : 1U);
+    tilingData_.baseParams.set_returnSoftmaxLse(qsfaInfo_->returnSoftmaxLse ? 1U : 0U);
 }
 
 // for flash decode
@@ -1298,6 +1299,7 @@ ge::graphStatus TQSFAInfoParser::GetAttrParaInfo()
     opParamInfo_.quantScaleRepoMode = attrs->GetAttrPointer<int64_t>(QUANT_SCALE_REPO_MODE_ATTR_INDEX);
     opParamInfo_.tileSize = attrs->GetAttrPointer<int64_t>(TILE_SIZE_ATTR_INDEX);
     opParamInfo_.ropeHeadDim = attrs->GetAttrPointer<int64_t>(ROPE_HEAD_DIM_ATTR_INDEX);
+    opParamInfo_.returnSoftmaxLse = attrs->GetAttrPointer<bool>(RETURN_SOFTMAX_LSE_ATTR_INDEX);
 
     return ge::GRAPH_SUCCESS;
 }
@@ -1644,6 +1646,7 @@ void TQSFAInfoParser::FillTilingInfoAttrsAndLayouts(TQSFATilingInfo &qsfaInfo)
     qsfaInfo.nextTokens = *opParamInfo_.nextTokens;
     qsfaInfo.tileSize = *opParamInfo_.tileSize;
     qsfaInfo.ropeHeadDim = *opParamInfo_.ropeHeadDim;
+    qsfaInfo.returnSoftmaxLse = (opParamInfo_.returnSoftmaxLse != nullptr) ? *opParamInfo_.returnSoftmaxLse : false;
 
     qsfaInfo.qLayout = qLayout_;
     qsfaInfo.topkLayout = topkLayout_;

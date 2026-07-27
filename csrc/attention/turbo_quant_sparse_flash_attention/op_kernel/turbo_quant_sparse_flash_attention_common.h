@@ -179,6 +179,7 @@ struct ConstInfo {
     QSFA_LAYOUT outputLayout;          // 输出的Transpose格式
     uint32_t sparseMode = 0;
     bool needInit = false;
+    bool returnSoftmaxLse = false;
 
     // FlashDecoding
     uint64_t combineLseOffset = 0ULL;

@@ -67,7 +67,8 @@ public:
                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
                                 __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
-                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax,
+                                __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
                                 const TurboQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
@@ -151,6 +152,8 @@ private:
     GlobalTensor<T> accumOutGm;
     GlobalTensor<T> lseSumFdGm;
     GlobalTensor<T> lseMaxFdGm;
+    GlobalTensor<T> softmaxMaxGm;
+    GlobalTensor<T> softmaxSumGm;
 
     // ================================Init functions==================================
     __aicore__ inline void InitTilingData();
@@ -211,6 +214,7 @@ template <typename QSFAT> __aicore__ inline void TurboQuantSparseFlashAttentionM
     constInfo.keyQuantMode = static_cast<QUANT_MODE>(tilingData->baseParams.keyQuantMode);
     constInfo.valueQuantMode = static_cast<QUANT_MODE>(tilingData->baseParams.valueQuantMode);
     constInfo.tileSize = tilingData->baseParams.tileSize;
+    constInfo.returnSoftmaxLse = (tilingData->baseParams.returnSoftmaxLse != 0);
     constInfo.combineHeadDim = (constInfo.quantScaleRepoMode ==
         QUANT_SCALE_REPO_MODE::COMBINE) ? constInfo.headDim + constInfo.headDimRope : constInfo.headDim;
 
@@ -406,7 +410,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
     __gm__ uint8_t *key, __gm__ uint8_t *value,
     __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
     __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
-    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut,
+    __gm__ uint8_t *softmaxMax, __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
     const TurboQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
     __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
@@ -436,6 +441,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
     valueGm.SetGlobalBuffer((__gm__ KV_T *)valuePtr);
 
     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
+    softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
+    softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
 
     if ASCEND_IS_AIV {
         if (constInfo.needInit && LAYOUT_T != QSFA_LAYOUT::TND) {
@@ -504,7 +511,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
             vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm, sTGm_);
         }
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm,
-                                           actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm);
+                                           actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm,
+                                           softmaxMaxGm, softmaxSumGm);
         vectorService.InitVec2GlobalTensor(accumOutGm, vec2ResGm, mm2ResGm, attentionOutGm);
     }
 

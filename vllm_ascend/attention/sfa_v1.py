@@ -1563,7 +1563,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         if self.use_tq_latent:  # TQ4 4-bit latent: fused csrc op reads int8 directly
             _ts = _tq_store()
             _q = torch.cat([_ts.had_fwd(ql_nope, head_dim=self.kv_lora_rank), q_pe], dim=-1).contiguous()
-            _ao = torch.ops._C_ascend.turboquant_sparse_flash_attention(
+            _ao, _, _ = torch.ops._C_ascend.turboquant_sparse_flash_attention(
                 _q, kv, kv, topk_indices, None, None, attn_metadata.block_table,
                 actual_seq_lengths_query, actual_seq_lengths_key,
                 float(self.scale), self.tq_key_quant_mode, self.tq_value_quant_mode, 1, "TND", "PA_BSND",
