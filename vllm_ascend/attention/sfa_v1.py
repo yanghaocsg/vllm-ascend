@@ -613,8 +613,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         self.tq_key_quant_mode = int(_additional_config.get("tq_key_quant_mode", 3))
         self.tq_value_quant_mode = int(_additional_config.get("tq_value_quant_mode", self.tq_key_quant_mode))
         self.tq_tile_size = int(_additional_config.get("tq_tile_size", 128))
-        _tq_cache_dtype = getattr(self.vllm_config.cache_config, "cache_dtype", "auto")
-        self.use_tq_latent = (_tq_cache_dtype == "turboquant_4bit_nc")
+        self.use_tq_latent = bool(_additional_config.get("enable_tq_latent", False))
         kv_transfer_config = self.vllm_config.kv_transfer_config
         self.is_kv_producer = kv_transfer_config is not None and kv_transfer_config.is_kv_producer
         self.is_kv_consumer = kv_transfer_config is not None and kv_transfer_config.is_kv_consumer

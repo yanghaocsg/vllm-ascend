@@ -277,13 +277,18 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
-        self.enable_sparse_sfa_c8 = additional_config.get("enable_sparse_sfa_c8", False) and use_sparse
-        self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
-        # TurboQuant 4-bit MLA latent storage (kv_cache[0] uint8 derived slot); SFA-side variant
+        # TurboQuant 4-bit MLA latent storage (kv_cache[0] uint8 derived slot); SFA-side variant.
         # Activated via the standard vLLM CLI flag --kv-cache-dtype turboquant_4bit_nc
         # (core-native K4V4 turboquant dtype); aligns TQ4 with vllm's kv-cache-dtype family.
-        _tq_cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", "auto")
-        self.enable_tq_latent = (_tq_cache_dtype == "turboquant_4bit_nc") and use_sparse
+        # Selected via --kv-cache-dtype turboquant_4bit_nc, which platform.py translates
+        # into this additional_config flag before the DSA cache_dtype reset.
+        self.enable_tq_latent = additional_config.get("enable_tq_latent", False) and use_sparse
+        # TQ4 needs the packed-SFA KV layout, so it self-enables enable_sparse_sfa_c8 here at
+        # config level, so the KV-cache spec AND memory profiling produce the packed pages too.
+        self.enable_sparse_sfa_c8 = (
+            additional_config.get("enable_sparse_sfa_c8", False) or self.enable_tq_latent
+        ) and use_sparse
+        self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(
             "c8_enable_reshape_optim", False
         )

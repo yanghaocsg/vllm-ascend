@@ -502,6 +502,14 @@ class NPUPlatform(Platform):
         ascend_config.update_compile_ranges_split_points()
 
         if model_config and hasattr(model_config.hf_text_config, "index_topk"):
+            # A CLI --kv-cache-dtype turboquant_4bit_nc selects the TurboQuant 4-bit KV path.
+            # Translate it into the enable_tq_latent flag (which survives to the worker via
+            # additional_config) before resetting cache_dtype: DSA models keep the model dtype
+            # as the KV base dtype so KV writes (scatter_nd_update) stay on a supported dtype.
+            if vllm_config.cache_config.cache_dtype == "turboquant_4bit_nc":
+                if vllm_config.additional_config is None:
+                    vllm_config.additional_config = {}
+                vllm_config.additional_config["enable_tq_latent"] = True
             vllm_config.cache_config.cache_dtype = str(model_config.dtype).replace("torch.", "")
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
