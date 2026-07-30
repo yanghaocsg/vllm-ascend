@@ -388,7 +388,7 @@ class NPUModelRunner(GPUModelRunner):
         # dsa c8
         self.enable_sparse_sfa_c8 = self.ascend_config.enable_sparse_sfa_c8
         self.enable_sparse_li_c8 = self.ascend_config.enable_sparse_li_c8
-        self.use_tq_latent = self.ascend_config.enable_tq_latent
+        self.use_tq_latent = self.ascend_config.enable_sfa_tq_latent
         # TQ4 reuses the c8 packed-KV layout, so the c8 cache dtypes must be set up
         # even when the user did not request enable_sparse_*_c8 explicitly.
         if self.enable_sparse_sfa_c8 or self.enable_sparse_li_c8 or self.use_tq_latent:

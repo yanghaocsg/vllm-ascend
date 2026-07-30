@@ -109,6 +109,7 @@ private:
     static constexpr uint64_t SYNC_MM2RES_BUF1_FLAG = 10;
     static constexpr uint64_t SYNC_MM2RES_BUF2_FLAG = 11;
     static constexpr uint64_t SYNC_FDOUTPUT_BUF_FLAG = 12;
+    static constexpr uint64_t SYNC_TQ_CACHE_READY_FLAG = 13;
 
     static constexpr uint64_t kvHeadNum = 1ULL;
     static constexpr uint64_t headDim = 512ULL;
@@ -142,6 +143,8 @@ private:
     GlobalTensor<Q_T> queryGm;
     GlobalTensor<KV_T> oriKvGm;
     GlobalTensor<KV_T> cmpKvGm;
+    GlobalTensor<uint8_t> oriTqGm;
+    GlobalTensor<uint8_t> cmpTqGm;
     GlobalTensor<SINKS_T> sinksGm;
 
     GlobalTensor<OUT_T> attentionOutGm;
@@ -214,6 +217,9 @@ __aicore__ inline void SparseAttnSharedkvSwa<SAST>::InitTilingData()
     constInfo.oriWinLeft = tilingData->baseParams.oriWinLeft;
     constInfo.oriWinRight = tilingData->baseParams.oriWinRight;
     constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
+    constInfo.kvQuantMode = tilingData->baseParams.kvQuantMode;
+    constInfo.oriKvSlotCount = tilingData->baseParams.oriKvSlotCount;
+    constInfo.cmpKvSlotCount = tilingData->baseParams.cmpKvSlotCount;
 
     constInfo.actualLenDimsQ = tilingData->baseParams.actualLenDimsQ;
     constInfo.actualLenDimsKV = tilingData->baseParams.actualLenDimsKV;
@@ -430,9 +436,16 @@ __aicore__ inline void SparseAttnSharedkvSwa<SAST>::Init(
     pipe = tPipe;
     // init global buffer
     queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
-    oriKvGm.SetGlobalBuffer((__gm__ KV_T *)oriKV);
-    if (constInfo.templateMode == CFA_TEMPLATE) {
-        cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
+    if (constInfo.kvQuantMode == 3) {
+        oriTqGm.SetGlobalBuffer((__gm__ uint8_t *)oriKV);
+        if (constInfo.templateMode == CFA_TEMPLATE) {
+            cmpTqGm.SetGlobalBuffer((__gm__ uint8_t *)cmpKV);
+        }
+    } else {
+        oriKvGm.SetGlobalBuffer((__gm__ KV_T *)oriKV);
+        if (constInfo.templateMode == CFA_TEMPLATE) {
+            cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
+        }
     }
 
     if (sinks != nullptr) {
@@ -478,6 +491,14 @@ __aicore__ inline void SparseAttnSharedkvSwa<SAST>::Init(
     vec2ResGm.SetGlobalBuffer(
         (__gm__ T *)(workspace + offset + aiCoreIdx * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(T)));
     offset += GetBlockNum() * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(T);
+
+    if (constInfo.kvQuantMode == 3) {
+        oriKvGm.SetGlobalBuffer((__gm__ KV_T *)(workspace + offset));
+        offset += constInfo.oriKvSlotCount * TQ4_HEAD_DIM * sizeof(KV_T);
+        if (constInfo.templateMode == CFA_TEMPLATE) {
+            cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)(workspace + offset));
+        }
+    }
 
     if ASCEND_IS_AIV {
         vectorBlock.InitParams(constInfo, tilingData);
@@ -626,6 +647,21 @@ __aicore__ inline void SparseAttnSharedkvSwa<SAST>::ComputeMm2(const RunInfo &in
 template <typename SAST>
 __aicore__ inline void SparseAttnSharedkvSwa<SAST>::Process()
 {
+    if (constInfo.kvQuantMode == 3) {
+        if ASCEND_IS_AIV {
+            uint32_t vectorCoreCount = 2U * GetBlockNum();
+            vectorBlock.DequantTqCache(oriTqGm, oriKvGm, constInfo.oriKvSlotCount, tmpBlockIdx, vectorCoreCount);
+            if (constInfo.templateMode == CFA_TEMPLATE) {
+                vectorBlock.DequantTqCache(cmpTqGm, cmpKvGm, constInfo.cmpKvSlotCount, tmpBlockIdx, vectorCoreCount);
+            }
+            SyncAll();
+            if (GetSubBlockIdx() == 0) {
+                CrossCoreSetFlag<ConstInfo::SAS_SYNC_MODE2, PIPE_MTE3>(SYNC_TQ_CACHE_READY_FLAG);
+            }
+        } else {
+            CrossCoreWaitFlag(SYNC_TQ_CACHE_READY_FLAG);
+        }
+    }
     uint32_t hasLoad = metadataGm.GetValue(GetAttrAbsIndex(aiCoreIdx, FA_CORE_ENABLE_INDEX, false));
     if (hasLoad == 0) {
         return;

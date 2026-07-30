@@ -98,6 +98,8 @@ constexpr uint32_t ATTR_ORI_WIN_RIGHT_INDEX = 7;
 constexpr uint32_t ATTR_LAYOUT_Q_INDEX = 8;
 constexpr uint32_t ATTR_LAYOUT_KV_INDEX = 9;
 constexpr uint32_t ATTR_RETURN_SOFTMAX_LSE = 10;
+constexpr uint32_t ATTR_KV_QUANT_MODE_INDEX = 11;
+constexpr uint32_t TQ4_SLOT_SIZE = 320;
 
 // Dim Index
 constexpr uint32_t DIM_IDX_ONE = 1;
@@ -157,6 +159,9 @@ TILING_DATA_FIELD_DEF(uint32_t, bmm2ResUbSize);
 TILING_DATA_FIELD_DEF(uint32_t, mBaseSize)
 TILING_DATA_FIELD_DEF(uint32_t, s2BaseSize)
 TILING_DATA_FIELD_DEF(bool, returnSoftmaxLse)
+TILING_DATA_FIELD_DEF(uint32_t, kvQuantMode)
+TILING_DATA_FIELD_DEF(uint64_t, oriKvSlotCount)
+TILING_DATA_FIELD_DEF(uint64_t, cmpKvSlotCount)
 END_TILING_DATA_DEF
 REGISTER_TILING_DATA_CLASS(SparseAttnSharedkvSwaParamsOp, SparseAttnSharedkvSwaParams)
 
@@ -205,6 +210,7 @@ struct SASParaInfo {
     const char *layoutQ = nullptr;
     const char *layoutKv = nullptr;
     const bool *returnSoftmaxLse = nullptr;
+    const int64_t *kvQuantMode = nullptr;
 };
 
 static std::string SASDataTypeToSerialString(ge::DataType type);
@@ -253,6 +259,9 @@ public:
     uint32_t sparseCount = 0;
 
     bool returnSoftmaxLse = false;
+    uint32_t kvQuantMode = 0;
+    uint64_t oriKvSlotCount = 0;
+    uint64_t cmpKvSlotCount = 0;
     // PageAttention
     uint32_t blockTypeSize = 0;
     uint32_t oriMaxBlockNumPerBatch = 0;
@@ -405,6 +414,7 @@ private:
     ge::DataType oriKvType_ = ge::DT_FLOAT16;
     ge::DataType cmpKvType_ = ge::DT_FLOAT16;
     ge::DataType outputType_ = ge::DT_FLOAT16;
+    uint32_t kvQuantMode_ = 0;
 };
 
 template <typename T> inline T Align(T num, T rnd)
@@ -522,6 +532,7 @@ public:
     ge::DataType sinksType_ = ge::DT_INT32;
     ge::DataType metadataType_ = ge::DT_INT32;
     ge::DataType outputType_ = ge::DT_FLOAT16;
+    uint32_t kvQuantMode_ = 0;
 
     gert::Shape qShape_{};
     gert::Shape oriKvShape_{};

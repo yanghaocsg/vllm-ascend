@@ -185,10 +185,30 @@ class AscendDeepseekV4SWACache(VllmDeepseekV4SWACache):
     ):
         super().__init__(head_dim, window_size, torch.uint8, prefix, cache_config)
         self.dtype = dtype
+        self.use_tq_latent = get_ascend_config().enable_dsa_tq_latent
 
         self.block_size = _dsv4_block_sizes()[cache_config.block_size][0][1]
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        if self.use_tq_latent:
+            if enable_dsa_cp():
+                raise RuntimeError("DeepSeek V4 TurboQuant KV cache does not support DSA context parallel yet.")
+            device_type = get_ascend_device_type()
+            if device_type not in {AscendDeviceType.A2, AscendDeviceType.A3}:
+                raise RuntimeError(
+                    "DeepSeek V4 TurboQuant KV cache is only supported on Ascend A2/A3, "
+                    f"got {device_type}."
+                )
+            return AscendSlidingWindowMLASpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=320,
+                dtype=torch.uint8,
+                sliding_window=self.window_size,
+                cache_dtype_str="turboquant_4bit_nc",
+                model_version="deepseek_v4",
+                alignment=None,
+            )
         if get_ascend_device_type() in {AscendDeviceType.A5}:
             self.dtype = torch.float8_e4m3fn
             vllm_config.cache_config.cache_dtype = "float8_e4m3fn"

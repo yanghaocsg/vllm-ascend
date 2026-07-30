@@ -277,16 +277,21 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
-        # TurboQuant 4-bit MLA latent storage (kv_cache[0] uint8 derived slot); SFA-side variant.
-        # Activated via the standard vLLM CLI flag --kv-cache-dtype turboquant_4bit_nc
-        # (core-native K4V4 turboquant dtype); aligns TQ4 with vllm's kv-cache-dtype family.
-        # Selected via --kv-cache-dtype turboquant_4bit_nc, which platform.py translates
-        # into this additional_config flag before the DSA cache_dtype reset.
-        self.enable_tq_latent = additional_config.get("enable_tq_latent", False) and use_sparse
+        # TurboQuant 4-bit latent/shared-KV storage. The public flag is model
+        # agnostic; model-specific paths derive their own enablement below.
+        self.enable_tq_latent = bool(additional_config.get("enable_tq_latent", False))
+        hf_text_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        use_dsa = hf_text_config is not None and hasattr(hf_text_config, "compress_ratios")
+        self.enable_sfa_tq_latent = self.enable_tq_latent and use_sparse
+        self.enable_dsa_tq_latent = self.enable_tq_latent and use_dsa
+        if self.enable_tq_latent and not (self.enable_sfa_tq_latent or self.enable_dsa_tq_latent):
+            raise RuntimeError(
+                "turboquant_4bit_nc is only supported for sparse SFA or DeepSeek V4 DSA models."
+            )
         # TQ4 needs the packed-SFA KV layout, so it self-enables enable_sparse_sfa_c8 here at
         # config level, so the KV-cache spec AND memory profiling produce the packed pages too.
         self.enable_sparse_sfa_c8 = (
-            additional_config.get("enable_sparse_sfa_c8", False) or self.enable_tq_latent
+            additional_config.get("enable_sparse_sfa_c8", False) or self.enable_sfa_tq_latent
         ) and use_sparse
         self.enable_sparse_li_c8 = additional_config.get("enable_sparse_li_c8", False) and use_sparse
         self.c8_enable_reshape_optim = self.enable_sparse_li_c8 and additional_config.get(

@@ -49,6 +49,8 @@ public:
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> sinksGm, GlobalTensor<T> softmaxLseGm);
     __aicore__ inline void InitVec2GlobalTensor(GlobalTensor<T> accumOutGm, GlobalTensor<UPDATE_T> vec2ResGm,
                                                 GlobalTensor<MM2_OUT_T> mm2ResGm, GlobalTensor<OUT_T> attentionOutGm);
+    __aicore__ inline void DequantTqCache(GlobalTensor<uint8_t> &source, GlobalTensor<KV_T> &destination,
+                                          uint64_t slotCount, uint32_t vectorCoreIdx, uint32_t vectorCoreCount);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
     __aicore__ inline void CopySinksIn();
@@ -152,6 +154,7 @@ private:
 
     TBuf<> tmpBuff1;        // 32K
     TBuf<> v0ValidSizeBuff; // 8K
+    TBuf<> tqCentBuff;      // 256B
 
     TBuf<> sinksBuff;     // 1K
     TBuf<> sinksBrcbBuff; // 12K
@@ -183,6 +186,10 @@ __aicore__ inline void SWAVectorBlock<SAST>::InitBuffers(TPipe *pipe)
 
     pipe->InitBuffer(tmpBuff1, ConstInfo::BUFFER_SIZE_BYTE_32K);
     pipe->InitBuffer(v0ValidSizeBuff, ConstInfo::BUFFER_SIZE_BYTE_8K);
+    if (constInfo.kvQuantMode == 3) {
+        pipe->InitBuffer(tqCentBuff, ConstInfo::BUFFER_SIZE_BYTE_256B);
+        LoadTq4Centroids(tqCentBuff.Get<float>());
+    }
 
     // M_MAX = 512/2vector = 256, 256 * sizeof(T) * N_Buffer
     pipe->InitBuffer(softmaxMaxBuff, ConstInfo::BUFFER_SIZE_BYTE_1K * constInfo.preLoadNum);
@@ -205,6 +212,32 @@ __aicore__ inline void SWAVectorBlock<SAST>::InitBuffers(TPipe *pipe)
 
     sinksUb = sinksBuff.Get<SINKS_T>();
     sinksBrcbUb = sinksBrcbBuff.Get<SINKS_T>();
+}
+
+template <typename SAST>
+__aicore__ inline void SWAVectorBlock<SAST>::DequantTqCache(
+    GlobalTensor<uint8_t> &source, GlobalTensor<KV_T> &destination, uint64_t slotCount,
+    uint32_t vectorCoreIdx, uint32_t vectorCoreCount)
+{
+    LocalTensor<uint8_t> slot = inputBuff2.Get<uint8_t>();
+    LocalTensor<KV_T> output = inputBuff2.Get<KV_T>()[ConstInfo::BUFFER_SIZE_BYTE_512B / sizeof(KV_T)];
+    LocalTensor<float> work = tmpBuff1.Get<float>();
+    LocalTensor<half> signedCodes = tmpBuff1.Get<half>()[ConstInfo::BUFFER_SIZE_BYTE_2K / sizeof(half)];
+    LocalTensor<int32_t> indices =
+        tmpBuff1.Get<int32_t>()[(ConstInfo::BUFFER_SIZE_BYTE_2K + ConstInfo::BUFFER_SIZE_BYTE_1K) / sizeof(int32_t)];
+    LocalTensor<float> centroids = tqCentBuff.Get<float>();
+
+    for (uint64_t slotIdx = vectorCoreIdx; slotIdx < slotCount; slotIdx += vectorCoreCount) {
+        DataCopy(slot, source[slotIdx * TQ4_SLOT_BYTES], TQ4_SLOT_BYTES);
+        SetFlag<HardEvent::MTE2_V>(0);
+        WaitFlag<HardEvent::MTE2_V>(0);
+        DequantTq4Slot(slot, output, work, signedCodes, indices, centroids);
+        SetFlag<HardEvent::V_MTE3>(0);
+        WaitFlag<HardEvent::V_MTE3>(0);
+        DataCopy(destination[slotIdx * TQ4_HEAD_DIM], output, TQ4_HEAD_DIM);
+        SetFlag<HardEvent::MTE3_V>(0);
+        WaitFlag<HardEvent::MTE3_V>(0);
+    }
 }
 
 

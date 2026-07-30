@@ -109,6 +109,7 @@ private:
     static constexpr uint32_t SYNC_C1_V1_FLAG = 7;
     static constexpr uint32_t SYNC_V1_C2_FLAG = 8;
     static constexpr uint32_t SYNC_C2_V2_FLAG = 9;
+    static constexpr uint32_t SYNC_TQ_CACHE_READY_FLAG = 13;
 
     static constexpr uint64_t kvHeadNum = 1ULL;
     static constexpr uint64_t headDim = 512ULL;
@@ -137,6 +138,8 @@ private:
     GlobalTensor<Q_T> queryGm;
     GlobalTensor<KV_T> oriKvGm;
     GlobalTensor<KV_T> cmpKvGm;
+    GlobalTensor<uint8_t> oriTqGm;
+    GlobalTensor<uint8_t> cmpTqGm;
     GlobalTensor<SINKS_T> sinksGm;
 
     GlobalTensor<OUT_T> attentionOutGm;
@@ -217,6 +220,9 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::InitTilingData()
     constInfo.actualLenDimsQ = tilingData->baseParams.actualLenDimsQ;
     constInfo.actualLenDimsKV = tilingData->baseParams.actualLenDimsKV;
     constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
+    constInfo.kvQuantMode = tilingData->baseParams.kvQuantMode;
+    constInfo.oriKvSlotCount = tilingData->baseParams.oriKvSlotCount;
+    constInfo.cmpKvSlotCount = tilingData->baseParams.cmpKvSlotCount;
     // innerSplitParams
     constInfo.mBaseSize = constInfo.gSize;
     constInfo.s2BaseSize = tilingData->baseParams.s2BaseSize;
@@ -422,8 +428,13 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::Init(
     pipe = tPipe;
     // init global buffer
     queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
-    oriKvGm.SetGlobalBuffer((__gm__ KV_T *)oriKV);
-    cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
+    if (constInfo.kvQuantMode == 3) {
+        oriTqGm.SetGlobalBuffer((__gm__ uint8_t *)oriKV);
+        cmpTqGm.SetGlobalBuffer((__gm__ uint8_t *)cmpKV);
+    } else {
+        oriKvGm.SetGlobalBuffer((__gm__ KV_T *)oriKV);
+        cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
+    }
 
     if (sinks != nullptr) {
         sinksGm.SetGlobalBuffer((__gm__ SINKS_T *)sinks);
@@ -473,10 +484,15 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::Init(
 
     kvValidSizeGm_.SetGlobalBuffer(
         (__gm__ int32_t *)(workspace + offset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
+    offset += GetBlockNum() * 2 * 128 * 4 * sizeof(int32_t);
+
+    if (constInfo.kvQuantMode == 3) {
+        oriKvGm.SetGlobalBuffer((__gm__ KV_T *)(workspace + offset));
+    }
 
     if ASCEND_IS_AIV {
         vectorBlock.InitParams(constInfo, tilingData);
-        vectorBlock.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, oriKvGm, cmpKvGm, oriBlockTableGm,
+        vectorBlock.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, oriKvGm, cmpKvGm, cmpTqGm, oriBlockTableGm,
                                          cmpBlockTableGm);
         vectorBlock.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm, actualSeqLengthsKVGm, topKGm,
                                          sinksGm, softmaxLseGm);
@@ -642,6 +658,18 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::ComputeMm2(const RunInfo &i
 template <typename SAST>
 __aicore__ inline void SparseAttnSharedkvScfa<SAST>::Process()
 {
+    if (constInfo.kvQuantMode == 3) {
+        if ASCEND_IS_AIV {
+            uint32_t vectorCoreCount = 2U * GetBlockNum();
+            vectorBlock.DequantTqCache(oriTqGm, oriKvGm, constInfo.oriKvSlotCount, tmpBlockIdx, vectorCoreCount);
+            SyncAll();
+            if (GetSubBlockIdx() == 0) {
+                CrossCoreSetFlag<ConstInfo::SAS_SYNC_MODE2, PIPE_MTE3>(SYNC_TQ_CACHE_READY_FLAG);
+            }
+        } else {
+            CrossCoreWaitFlag(SYNC_TQ_CACHE_READY_FLAG);
+        }
+    }
     uint32_t hasLoad = metadataGm.GetValue(GetAttrAbsIndex(aiCoreIdx, FA_CORE_ENABLE_INDEX, false));
     if (hasLoad == 0) {
         return;

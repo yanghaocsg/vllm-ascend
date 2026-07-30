@@ -273,6 +273,9 @@ struct ConstInfo {
     uint32_t cmpMaskMode = 0;
     uint32_t oriKvStride = 0;
     uint32_t cmpKvStride = 0;
+    uint32_t kvQuantMode = 0;
+    uint64_t oriKvSlotCount = 0ULL;
+    uint64_t cmpKvSlotCount = 0ULL;
     bool needInit = false;
     uint32_t templateMode = 0;
 
@@ -313,6 +316,63 @@ struct ConstInfo {
     // 是否返回SoftmaxLse
     bool returnSoftmaxLse = false;
 };
+
+constexpr uint32_t TQ4_HEAD_DIM = 512U;
+constexpr uint32_t TQ4_SLOT_BYTES = 320U;
+constexpr uint32_t TQ4_PACKED_BYTES = 256U;
+
+__aicore__ inline void LoadTq4Centroids(LocalTensor<float> centroids)
+{
+    centroids.SetValue(0, 0.00547294f);
+    centroids.SetValue(1, 0.01680406f);
+    centroids.SetValue(2, 0.02857605f);
+    centroids.SetValue(3, 0.04108622f);
+    centroids.SetValue(4, 0.05492980f);
+    centroids.SetValue(5, 0.07101817f);
+    centroids.SetValue(6, 0.09115373f);
+    centroids.SetValue(7, 0.12037795f);
+    centroids.SetValue(8, -0.12091285f);
+    centroids.SetValue(9, -0.09111122f);
+    centroids.SetValue(10, -0.07112455f);
+    centroids.SetValue(11, -0.05513602f);
+    centroids.SetValue(12, -0.04132067f);
+    centroids.SetValue(13, -0.02874970f);
+    centroids.SetValue(14, -0.01700489f);
+    centroids.SetValue(15, -0.00568677f);
+    PipeBarrier<PIPE_ALL>();
+}
+
+template <typename KV_T>
+__aicore__ inline void DequantTq4Slot(LocalTensor<uint8_t> slot, LocalTensor<KV_T> output,
+                                      LocalTensor<float> work, LocalTensor<half> signedCodes,
+                                      LocalTensor<int32_t> indices, LocalTensor<float> centroids)
+{
+    LocalTensor<int4b_t> packedCodes = slot.template ReinterpretCast<int4b_t>();
+    LocalTensor<uint16_t> slotU16 = slot.template ReinterpretCast<uint16_t>();
+    LocalTensor<uint32_t> unsignedIndices = indices.template ReinterpretCast<uint32_t>();
+
+    Cast(signedCodes, packedCodes, RoundMode::CAST_NONE, TQ4_HEAD_DIM);
+    PipeBarrier<PIPE_V>();
+    Adds(signedCodes, signedCodes, static_cast<half>(8.0f), TQ4_HEAD_DIM);
+    PipeBarrier<PIPE_V>();
+    Muls(signedCodes, signedCodes, static_cast<half>(sizeof(float)), TQ4_HEAD_DIM);
+    PipeBarrier<PIPE_V>();
+    Cast(indices, signedCodes, RoundMode::CAST_ROUND, TQ4_HEAD_DIM);
+    PipeBarrier<PIPE_V>();
+    Gather(work, centroids, unsignedIndices, 0, TQ4_HEAD_DIM);
+    PipeBarrier<PIPE_V>();
+
+    uint16_t normBits = slotU16.GetValue(TQ4_PACKED_BYTES / sizeof(uint16_t));
+    half norm = *reinterpret_cast<half *>(&normBits);
+    Muls(work, work, static_cast<float>(norm), TQ4_HEAD_DIM);
+    PipeBarrier<PIPE_V>();
+    if constexpr (IsSameType<KV_T, bfloat16_t>::value) {
+        Cast(output, work, RoundMode::CAST_RINT, TQ4_HEAD_DIM);
+    } else {
+        Cast(output, work, RoundMode::CAST_ROUND, TQ4_HEAD_DIM);
+    }
+    PipeBarrier<PIPE_V>();
+}
 
 struct MSplitInfo {
     uint32_t nBufferIdx = 0U;
