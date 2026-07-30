@@ -479,17 +479,11 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
                               aiCoreIdx * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(T)));
     qsfaOffset += GetBlockNum() * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T);
 
-    GlobalTensor<half> sTGm_;   // [O8/O9] per-token s_t export/consume GM (only used in V_TEMPLATE)
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
         // s2  d+rope bufNum
         kvMergeGm_.SetGlobalBuffer((__gm__ K_ROPE_T *)(workspace + qsfaOffset + aiCoreIdx * 512 *
                                    constInfo.combineHeadDim * 4 * sizeof(K_ROPE_T)));
         qsfaOffset += GetBlockNum() * 512 * constInfo.combineHeadDim * 4 * sizeof(K_ROPE_T);
-
-        // [O8/O9] per-token s_t GM: [4 * s2BaseSize(512)] half per core (matches sTGm_ read offset
-        // loop%4 * s2BaseSize in DealBmm1ResBaseBlock). op_host workspace bumped by aivNum*4*512*2B.
-        sTGm_.SetGlobalBuffer((__gm__ half *)(workspace + qsfaOffset + (uint64_t)aiCoreIdx * 4 * 512 * sizeof(half)));
-        qsfaOffset += (uint64_t)GetBlockNum() * 4 * 512 * sizeof(half);
 
         kvValidSizeGm_.SetGlobalBuffer(
             (__gm__ int32_t *)(workspace + qsfaOffset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
@@ -508,7 +502,7 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
         vectorService.InitParams(constInfo, tilingData);
         vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm, sTGm_);
+            vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
         }
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm,
                                            actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm,

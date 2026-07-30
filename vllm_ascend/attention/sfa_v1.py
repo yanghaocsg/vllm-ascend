@@ -1248,9 +1248,12 @@ class AscendSFAImpl(MLAAttentionImpl):
             _vnf = _vn.contiguous().view(torch.float16).float().view(-1, 1)
             _sc_f = (_vnf * _inv)
             _sc = _sc_f.to(torch.float16).view(torch.uint8).view(-1, 2)
-            # [O8 pre-divide] store K_rope' = K_rope / s_t; attention re-applies s_t per-column.
-            _rb = (_kpe_r.float() / (_sc_f + 1e-20)).to(torch.bfloat16).contiguous().view(torch.uint8).view(-1, _rope_bytes).view(torch.int8)
+            _rb = _kpe_r.to(torch.bfloat16).contiguous().view(torch.uint8).view(-1, _rope_bytes).view(torch.int8)   # [O8 REVERTED] store K_rope undivided (pre-6bedc916 behaviour)
             _comb = torch.cat([_nib.view(torch.int8), _rb.view(torch.int8), _sc.view(torch.int8)], dim=-1)
+            if _rd_on() and int(slots.numel()) > 0:
+                _rd_save(self, "tqmid", int(slots.numel()), {
+                    "k_nope_normed": _kvc_n, "k_pe_roped": _kpe_r, "s_t": _sc_f,
+                    "slot": _comb, "slots": slots})        # REF_847_PROBE
             torch_npu.npu_scatter_nd_update_(kv_cache[0].view(-1, _comb.shape[-1]), slots.view(-1, 1), _comb.view(-1, _comb.shape[-1]))
             if self.enable_dsa_cp:
                 return None, _comb

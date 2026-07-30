@@ -376,7 +376,6 @@ void TQSFAMlaTiling::GetWorkspaceSize()
     workspaceSize_ += preLoadNum * bmm2ResUbSize_ * actCoreNum * bmm2ResElemSize; // vec2ResGm
     workspaceSize_ += 4 * 512 * qsfaInfo_->qHeadDim * NUM_BYTES_FLOAT16 * actCoreNum;
     workspaceSize_ += 4 * 128 * 4 * (2 * actCoreNum);
-    workspaceSize_ += (size_t)4 * 512 * NUM_BYTES_FLOAT16 * actCoreNum; // O8/O9 sTGm_ s_t [4*s2BaseSize] half/core
 
     CalcFDWorkSpace(actCoreNum);
 }

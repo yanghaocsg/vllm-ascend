@@ -47,8 +47,7 @@ public:
                                                 const GlobalTensor<K_ROPE_T> &kvMergeGm,
                                                 const GlobalTensor<K_ROPE_T> &keyRopeGm,
                                                 const GlobalTensor<KV_T> &keyGm,
-                                                const GlobalTensor<int32_t> &blkTableGm,
-                                                const GlobalTensor<half> &sTGm);
+                                                const GlobalTensor<int32_t> &blkTableGm);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<K_ROPE_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
@@ -205,12 +204,6 @@ private:
     // needs no nibble masks / reorder idx.
     TBuf<> tq4CentBuf_;    // 16 float (centSigned[k] = _CENT[(k+8)%16])
     LocalTensor<float> tq4Cent_;
-
-    // [O8/O9 attention-fold] per-token s_t (totalScale) exported by O9 (CopyOutMrgeResult) to sTGm_,
-    // consumed per-column by O8 (DealBmm1ResBaseBlock). sTIdxBuf holds Gather byte-offsets i*32
-    // (precomputed once @InitBuffers) for the O9 bulk 32B->2B extract.
-    GlobalTensor<half> sTGm_;
-    TBuf<> sTIdxBuf;
 };
 
 template <typename QSFAT> __aicore__ inline void QSFAVectorService<QSFAT>::InitBuffers(TPipe *pipe)
@@ -253,13 +246,6 @@ template <typename QSFAT> __aicore__ inline void QSFAVectorService<QSFAT>::InitB
     tq4Cent_.SetValue(10,-0.07112455f);  tq4Cent_.SetValue(11,-0.05513602f);
     tq4Cent_.SetValue(12,-0.04132067f);  tq4Cent_.SetValue(13,-0.02874970f);
     tq4Cent_.SetValue(14,-0.01700489f);  tq4Cent_.SetValue(15,-0.00568677f);
-    // [O9] Gather byte-offsets i*32 for bulk s_t extract (first 2B of each 32B row). Max dealRow =
-    // INPUT1_BUFFER_OFFSET(32K)/combineDimAlign(~416B) ~= 78, so 128 entries covers it.
-    pipe->InitBuffer(sTIdxBuf, 512);
-    LocalTensor<uint32_t> sTIdxInit = sTIdxBuf.Get<uint32_t>();
-    for (uint32_t i = 0; i < 128; ++i) {
-        sTIdxInit.SetValue(i, i * 32);
-    }
     PipeBarrier<PIPE_ALL>();
 }
 
@@ -282,15 +268,13 @@ QSFAVectorService<QSFAT>::InitMm2ResInt32GmGlobalTensor(GlobalTensor<int32_t> mm
 template <typename QSFAT>
 __aicore__ inline void QSFAVectorService<QSFAT>::InitVec0GlobalTensor(
     const GlobalTensor<int32_t> &kvValidSizeGm, const GlobalTensor<K_ROPE_T> &kvMergeGm,
-    const GlobalTensor<K_ROPE_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm,
-    const GlobalTensor<half> &sTGm)
+    const GlobalTensor<K_ROPE_T> &keyRopeGm, const GlobalTensor<KV_T> &keyGm, const GlobalTensor<int32_t> &blkTableGm)
 {
     this->kvMergeGm_ = kvMergeGm;
     this->keyRopeGm_ = keyRopeGm;
     this->keyGm_ = keyGm;
     this->blkTableGm_ = blkTableGm;
     this->kvValidSizeGm_ = kvValidSizeGm;
-    this->sTGm_ = sTGm;   // [O8/O9] per-token s_t export/consume GM
 }
 
 template <typename QSFAT>
@@ -578,19 +562,6 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm1ResBaseBlock(
     WaitFlag<AscendC::HardEvent::V_MTE2>(SYNC_INPUT_BUF1_FLAG + pingpongFlag);
 
     DataCopy(qsfaMmResUb, mm1ResGm[qsfaInOutGmOffset], qsfaComputeSize);
-    // [O8 pre-divide] load per-column s_t [0..columnCount) (fp16) from sTGm_ (written by O9 in
-    // CopyOutMrgeResult V0 stage; cross-core staging guarantees visibility, no extra flag). One load
-    // feeds BOTH per-column Muls (pre-softmax F*s_t, post-softmax P*s_t). tmpBuff2 free here (softmax
-    // uses tmpBuff1); sTUbF32 survives across SoftmaxFlashV2.
-    LocalTensor<half> sTUbHalf = tmpBuff2.Get<half>();
-    LocalTensor<float> sTUbF32 = tmpBuff2.Get<float>()[256];
-    DataCopyExtParams sTLoadParams;
-    sTLoadParams.blockCount = 1;
-    sTLoadParams.blockLen = columnCount * sizeof(half);
-    sTLoadParams.srcStride = 0;
-    sTLoadParams.dstStride = 0;
-    DataCopyPadExtParams<half> sTPadParams{false, 0, 0, 0};
-    DataCopyPad(sTUbHalf, sTGm_[info.loop % MERGE_CACHE_GM_BUF_NUM * constInfo.s2BaseSize], sTLoadParams, sTPadParams);
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
         if (loopId == 0) {
             WaitFlag<HardEvent::MTE2_S>(0);
@@ -601,14 +572,6 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm1ResBaseBlock(
 
     ElewiseCompute(info, qsfaMmResUb, dealRowCount, columnCount);
 
-    // [O8 pre-divide pre-softmax] cube produced F = true_score/s_t (nope unscaled + rope/s_t);
-    // ElewiseCompute applied scaleValue. Per-column Mul(F, s_t) -> true_score. -inf cols stay -inf.
-    PipeBarrier<PIPE_V>();
-    Cast(sTUbF32, sTUbHalf, AscendC::RoundMode::CAST_NONE, columnCount);
-    PipeBarrier<PIPE_V>();
-    for (uint32_t r = 0; r < dealRowCount; ++r) {
-        Mul(qsfaMmResUb[r * columnCount], qsfaMmResUb[r * columnCount], sTUbF32[0], columnCount);
-    }
     PipeBarrier<PIPE_V>();
     LocalTensor<T> qsfaTmpAFloorUb = tmpBuff1.Get<T>();
     LocalTensor<uint8_t> qsfaSoftmaxTmpUb = qsfaTmpAFloorUb.template ReinterpretCast<uint8_t>();
@@ -616,12 +579,6 @@ __aicore__ inline void QSFAVectorService<QSFAT>::DealBmm1ResBaseBlock(
     SoftmaxFlashV2Compute(info, mSplitInfo, qsfaMmResUb, qsfaSoftmaxTmpUb, startRow, dealRowCount, columnCount,
                             info.actualSingleProcessSInnerSize);
 
-    // [O8 pre-divide post-softmax] per-column Mul(P, s_t) so MMAD#2 (P*s_t)@y_hat_unscaled = P@V_true
-    // (V=unscaled y_hat). Masked cols P=0 -> 0*s_t=0. sTUbF32 survived softmax in tmpBuff2.
-    PipeBarrier<PIPE_V>();
-    for (uint32_t r = 0; r < dealRowCount; ++r) {
-        Mul(qsfaMmResUb[r * columnCount], qsfaMmResUb[r * columnCount], sTUbF32[0], columnCount);
-    }
     PipeBarrier<PIPE_V>();
     LocalTensor<K_ROPE_T> tmpMMResCastTensor = outputBuff1.Get<K_ROPE_T>();
     WaitFlag<AscendC::HardEvent::MTE3_V>(SYNC_OUTPUT_BUF1_FLAG);
@@ -770,9 +727,18 @@ QSFAVectorService<QSFAT>::Tq4DequantRows(LocalTensor<KV_T> &srcTensor, LocalTens
         Gather(workBase, centBuf, idxU, 0, cnt);                    // non-negative offsets only (base 0)
         PipeBarrier<PIPE_V>();
 
-        // [O8 pre-divide] per-row Muls(s_t) DELETED: output UNSCALED y_hat (centroids only). s_t is
-        // exported to sTGm_ by O9 below and re-applied per-column on the attention side
-        // (DealBmm1ResBaseBlock pre/post-softmax Mul). V=unscaled y_hat.
+        // Per-row scale in-place: each Muls writes a disjoint workBase[rr*HD) region and reads only
+        // that same region (written by the Gather above, already drained), so the `cur` Muls carry no
+        // mutual RAW/WAR hazard and need no barrier between them. One V-drain after the last Muls, then
+        // a single batched output Cast over all `cur` rows (workBase and dstB16 are both row-contiguous).
+        for (int32_t rr = 0; rr < cur; ++rr) {
+            int32_t r = base + rr;
+            uint16_t sbits = slotU16.GetValue((r * ROW_BYTES + SCALE_BYTE) / 2);
+            half scale = *reinterpret_cast<half *>(&sbits);
+            Muls(workBase[rr * HD], workBase[rr * HD], static_cast<float>(scale), HD);
+        }
+
+        PipeBarrier<PIPE_V>();
         if constexpr (IsSameType<K_ROPE_T, bfloat16_t>::value) {
             Cast(dstB16[base * HD], workBase, RoundMode::CAST_RINT, cnt);
         } else {
@@ -780,8 +746,7 @@ QSFAVectorService<QSFAT>::Tq4DequantRows(LocalTensor<KV_T> &srcTensor, LocalTens
         }
         PipeBarrier<PIPE_V>();
     }
-    SetFlag<AscendC::HardEvent::V_MTE3>(0);
-    WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+    PipeBarrier<PIPE_ALL>();
 }
 
 template <typename QSFAT>
@@ -896,35 +861,6 @@ __aicore__ inline void QSFAVectorService<QSFAT>::CopyOutMrgeResult(int64_t mte2S
     if (constInfo.keyQuantMode == QUANT_MODE::TQ4) {
         // [TQ4] codebook dequant -> antiKvTensorAsB16 [dealRow,headDim] bf16
         Tq4DequantRows(srcTensor, antiKvTensorAsB16, dealRow);
-        // [O9] bulk s_t export -> sTGm_ (consumed per-column by O8 DealBmm1ResBaseBlock). Carrier scale is
-        // fp16 @ byte SCALE_BYTE=headDim/2+headDimRope*2=384 (half idx 192), token stride ROW_BYTES=
-        // CeilAlign(dSizeVInput,32)=416B=13 blocks. NBURST: read 1 block(32B)/token, srcStride=12 blocks
-        // (640B) -> [dealRow,32B] in sTUb32; Gather first 2B of each 32B row -> contiguous sTUb[dealRow].
-        {
-            uint32_t sTScaleByteOff = constInfo.headDim / 2 + constInfo.headDimRope * sizeof(K_ROPE_T);
-            uint32_t sTRowStrideBlk = QSFAAlign(slotBytes, static_cast<uint32_t>(BYTE_BLOCK)) / BYTE_BLOCK;
-            LocalTensor<half> sTUb = tmpBuff2.Get<half>();
-            LocalTensor<half> sTUb32 = tmpBuff2.Get<half>()[512];
-            LocalTensor<half> srcHalf = srcTensor.template ReinterpretCast<half>()[sTScaleByteOff / 2];
-            DataCopyParams sTGathParams;
-            sTGathParams.blockCount = static_cast<uint16_t>(dealRow);
-            sTGathParams.blockLen = 1;
-            sTGathParams.srcStride = static_cast<uint16_t>(sTRowStrideBlk - 1);
-            sTGathParams.dstStride = 0;
-            DataCopy(sTUb32, srcHalf, sTGathParams);
-            PipeBarrier<PIPE_V>();
-            LocalTensor<uint32_t> sTIdx = sTIdxBuf.Get<uint32_t>();
-            Gather(sTUb, sTUb32, sTIdx, 0, static_cast<uint32_t>(dealRow));
-            SetFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-            WaitFlag<AscendC::HardEvent::V_MTE3>(SYNC_OUTPUT_BUF1_FLAG);
-            DataCopyExtParams sTParams;
-            sTParams.blockCount = 1;
-            sTParams.blockLen = static_cast<uint32_t>(dealRow) * sizeof(half);
-            sTParams.srcStride = 0;
-            sTParams.dstStride = 0;
-            DataCopyPad(sTGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * constInfo.s2BaseSize + s2GmStartOffset + mte3Size],
-                        sTUb, sTParams);
-        }
         qsfaRopeByteOff = constInfo.headDim / 2;
 
         DataCopyExtParams tq4DataCopyParams;
