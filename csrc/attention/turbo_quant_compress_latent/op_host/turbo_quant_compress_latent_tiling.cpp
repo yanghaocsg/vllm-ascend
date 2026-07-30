@@ -7,6 +7,10 @@ constexpr uint32_t MAX_AI_CORES = 40;
 
 static ge::graphStatus TilingFunc(gert::TilingContext* context)
 {
+    const int64_t* outputMode = context->GetAttrs()->GetAttrPointer<int64_t>(0);
+    if (outputMode == nullptr || (*outputMode != 0 && *outputMode != 1)) {
+        return ge::GRAPH_FAILED;
+    }
     const gert::StorageShape* latentShape = context->GetInputShape(0);
     uint32_t numTokens = latentShape->GetStorageShape().GetDim(0);
     if (numTokens < 1) numTokens = 1;
@@ -25,6 +29,7 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     tilingData.set_num_tokens(numTokens);
     tilingData.set_tokens_per_core(tokensPerCore);
     tilingData.set_tokens_per_batch(tokensPerBatch);
+    tilingData.set_output_mode(static_cast<uint32_t>(*outputMode));
 
     context->SetBlockDim(blockDim);
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),

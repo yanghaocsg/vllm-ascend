@@ -6,6 +6,39 @@ import torch
 from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
 
 
+def test_dsa_kv_compress_scatter_reinterprets_uint8_without_copy():
+    cache = torch.arange(32, dtype=torch.uint8).reshape(2, 1, 16)
+    source = torch.arange(16, dtype=torch.uint8).reshape(1, 1, 16)
+    slot_mapping = torch.tensor([1], dtype=torch.int32)
+
+    with mock.patch(
+        "vllm_ascend.device.device_op.torch.ops._C_ascend.npu_scatter_nd_update_v2",
+        create=True,
+    ) as mock_scatter:
+        BaseDeviceAdaptor.dsa_kv_compress_scatter(cache, source, slot_mapping)
+
+    scatter_cache, scatter_slot_mapping, scatter_source = mock_scatter.call_args.args
+    assert scatter_cache.dtype == torch.int8
+    assert scatter_source.dtype == torch.int8
+    assert scatter_cache.data_ptr() == cache.data_ptr()
+    assert scatter_source.data_ptr() == source.data_ptr()
+    assert scatter_slot_mapping is slot_mapping
+
+
+def test_dsa_kv_compress_scatter_preserves_supported_dtype():
+    cache = torch.zeros((2, 1, 16), dtype=torch.bfloat16)
+    source = torch.ones((1, 1, 16), dtype=torch.bfloat16)
+    slot_mapping = torch.tensor([1], dtype=torch.int32)
+
+    with mock.patch(
+        "vllm_ascend.device.device_op.torch.ops._C_ascend.npu_scatter_nd_update_v2",
+        create=True,
+    ) as mock_scatter:
+        BaseDeviceAdaptor.dsa_kv_compress_scatter(cache, source, slot_mapping)
+
+    mock_scatter.assert_called_once_with(cache, slot_mapping, source)
+
+
 def test_npu_flash_attention_uses_fusion_attention_for_fp32():
     query = torch.randn(5, 4, 64, dtype=torch.float32)
     key = torch.randn_like(query)

@@ -1257,7 +1257,8 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_npu(const at::Tensor
     const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_kv,
     const c10::optional<at::Tensor> &sinks, const c10::optional<at::Tensor> &metadata,
     double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode, int64_t ori_win_left,
-    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse)
+    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse,
+    int64_t kv_quant_mode)
 {
     std::string layout_q_str = std::string(layout_q);
     std::string layout_kv_str = std::string(layout_kv);
@@ -1280,7 +1281,7 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_npu(const at::Tensor
     EXEC_NPU_CMD(aclnnSparseAttnSharedkv, q, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
         ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q, seqused_kv, sinks,
         metadata, softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_kv_stride, cmp_kv_stride, ori_win_left, ori_win_right, layout_q_ptr,
-        layout_kv_ptr, return_softmax_lse, attn_out, softmax_lse);
+        layout_kv_ptr, return_softmax_lse, kv_quant_mode, attn_out, softmax_lse);
     return std::tuple<at::Tensor, at::Tensor>(attn_out, softmax_lse);
 }
 
@@ -2433,7 +2434,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                 bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("turboquant_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::turboquant_sparse_flash_attention);
-    ops.def("turbo_quant_compress_latent(Tensor latent, Tensor centroids) -> Tensor");
+    ops.def("turbo_quant_compress_latent(Tensor latent, Tensor centroids, int output_mode=0) -> Tensor");
     ops.impl("turbo_quant_compress_latent", torch::kPrivateUse1, &vllm_ascend::turbo_quant_compress_latent);
 
     ops.def(
@@ -2660,7 +2661,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "int ori_win_right=0, "
             "str layout_q=\"BSND\", "
             "str layout_kv=\"PA_ND\", "
-            "bool return_softmax_lse=False"
+            "bool return_softmax_lse=False, "
+            "int kv_quant_mode=0"
         ") -> (Tensor out, Tensor softmax_lse)"
         );
     ops.impl("npu_sparse_attn_sharedkv", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attn_sharedkv_npu);

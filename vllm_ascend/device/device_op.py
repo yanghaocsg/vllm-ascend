@@ -811,7 +811,11 @@ class BaseDeviceAdaptor:
     @staticmethod
     def dsa_kv_compress_scatter(cache, x, slot_mapping):
         """Scatter KV into cache. Non-A5: simple scatter of pre-quantized tensor."""
-        torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, slot_mapping, x)
+        # aclnnScatterNdUpdateV2 does not accept uint8, while TQ4 cache slots
+        # are opaque bytes. Reinterpret them as int8 without copying.
+        scatter_cache = cache.view(torch.int8) if cache.dtype == torch.uint8 else cache
+        scatter_x = x.view(torch.int8) if x.dtype == torch.uint8 else x
+        torch.ops._C_ascend.npu_scatter_nd_update_v2(scatter_cache, slot_mapping, scatter_x)
 
     # ===== Indexer Quant + Scatter =====
 

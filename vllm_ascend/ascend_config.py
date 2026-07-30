@@ -24,6 +24,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+def _is_deepseek_v4_dsa_model(model_config: Any) -> bool:
+    hf_text_config = getattr(model_config, "hf_text_config", None)
+    return hf_text_config is not None and getattr(hf_text_config, "model_type", None) == "deepseek_v4"
+
+
 class AscendConfig:
     """
     Configuration Object for additional_config from vllm.configs.
@@ -277,12 +282,13 @@ class AscendConfig:
                     "enable_kv_nz is only supported in pd scenario and can only be used in D node."
                 )
 
-        # TurboQuant 4-bit MLA latent storage (kv_cache[0] uint8 derived slot); SFA-side variant.
-        # Activated via the standard vLLM CLI flag --kv-cache-dtype turboquant_4bit_nc
-        # (core-native K4V4 turboquant dtype); aligns TQ4 with vllm's kv-cache-dtype family.
-        # Selected via --kv-cache-dtype turboquant_4bit_nc, which platform.py translates
-        # into this additional_config flag before the DSA cache_dtype reset.
-        self.enable_tq_latent = additional_config.get("enable_tq_latent", False) and use_sparse
+        # Preserve the established SFA flag semantics. DeepSeek V4 derives a
+        # separate model-scoped flag from the same public cache dtype.
+        tq_latent_requested = bool(additional_config.get("enable_tq_latent", False))
+        self.enable_tq_latent = tq_latent_requested and use_sparse
+        self.enable_dsa_tq_latent = tq_latent_requested and _is_deepseek_v4_dsa_model(
+            vllm_config.model_config
+        )
         # TQ4 needs the packed-SFA KV layout, so it self-enables enable_sparse_sfa_c8 here at
         # config level, so the KV-cache spec AND memory profiling produce the packed pages too.
         self.enable_sparse_sfa_c8 = (

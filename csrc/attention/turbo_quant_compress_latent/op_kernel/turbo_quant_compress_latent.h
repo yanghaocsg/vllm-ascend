@@ -21,8 +21,12 @@ using namespace AscendC;
 constexpr uint32_t HEAD_DIM     = 512;
 constexpr uint32_t SLOT_PAD     = 320;
 constexpr uint32_t PACKED_BYTES = 256;   // 512 nibbles / 2
+constexpr uint32_t COMPACT_SLOT_BYTES = PACKED_BYTES + sizeof(half);
 constexpr uint32_t N_CENT       = 16;
 constexpr uint32_t ALIGN_BYTES  = 64;
+constexpr uint32_t OUTPUT_MODE_COMPACT_CORRECTED = 1;
+constexpr float CENTROID_BYTE_STRIDE = 4.0F;
+constexpr float NORM_SQUARED_EPS = 1e-16F;
 // Keep in sync with TQ_COMPRESS_MAX_TOKENS_PER_BATCH in the tiling header.
 constexpr uint32_t MAX_TOKENS_PER_BATCH = 12;
 // Each token's L2 norm reduces into its own 64B-aligned slot so one V->S sync covers the whole batch.
@@ -33,9 +37,12 @@ public:
     __aicore__ inline KernelTurboQuantCompressLatent() {}
 
     __aicore__ inline void Init(GM_ADDR latent, GM_ADDR centroids, GM_ADDR slotOut,
-                                uint32_t numTokens, uint32_t tokensPerCore, uint32_t tokensPerBatch)
+                                uint32_t numTokens, uint32_t tokensPerCore, uint32_t tokensPerBatch,
+                                uint32_t outputMode)
     {
         numTokens_ = numTokens;
+        compactCorrected_ = outputMode == OUTPUT_MODE_COMPACT_CORRECTED;
+        outputSlotBytes_ = compactCorrected_ ? COMPACT_SLOT_BYTES : SLOT_PAD;
         batch_ = tokensPerBatch < 1 ? 1 : tokensPerBatch;
         if (batch_ > MAX_TOKENS_PER_BATCH) batch_ = MAX_TOKENS_PER_BATCH;
 
@@ -168,9 +175,31 @@ private:
         }
         PipeBarrier<PIPE_V>();
 
+        if (compactCorrected_) {
+            Muls(tmp, nib, CENTROID_BYTE_STRIDE, elems);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<int32_t> codeOffsets = sel.ReinterpretCast<int32_t>();
+            LocalTensor<uint32_t> unsignedCodeOffsets = sel.ReinterpretCast<uint32_t>();
+            Cast(codeOffsets, tmp, RoundMode::CAST_ROUND, elems);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<float> cent = centBuf_.Get<float>();
+            Gather(tmp, cent, unsignedCodeOffsets, 0, elems);
+            PipeBarrier<PIPE_V>();
+            Mul(tmp, tmp, tmp, elems);
+            PipeBarrier<PIPE_V>();
+            for (uint32_t i = 0; i < cnt; ++i) {
+                ReduceSum(norm[i * NORM_SLOT_FLOATS], tmp[i * HEAD_DIM], work, HEAD_DIM);
+            }
+            PipeBarrier<PIPE_V>();
+        }
+
         WaitVToS();
         for (uint32_t i = 0; i < cnt; ++i) {
-            half hn = (half)normScalar_[i];
+            float outputScale = normScalar_[i];
+            if (compactCorrected_) {
+                outputScale /= sqrt(norm.GetValue(i * NORM_SLOT_FLOATS) + NORM_SQUARED_EPS);
+            }
+            half hn = (half)outputScale;
             uint16_t nbits = *reinterpret_cast<uint16_t*>(&hn);
             slot.SetValue(i * SLOT_PAD + PACKED_BYTES, (uint8_t)(nbits & 0xff));
             slot.SetValue(i * SLOT_PAD + PACKED_BYTES + 1, (uint8_t)((nbits >> 8) & 0xff));
@@ -183,7 +212,14 @@ private:
     __aicore__ inline void CopyOut(uint32_t t, uint32_t cnt)
     {
         LocalTensor<uint8_t> slot = outQ_.DeQue<uint8_t>();
-        DataCopy(slotGm_[(uint64_t)t * SLOT_PAD], slot, cnt * SLOT_PAD);
+        if (compactCorrected_) {
+            for (uint32_t i = 0; i < cnt; ++i) {
+                DataCopyParams copyParams{1, static_cast<uint16_t>(COMPACT_SLOT_BYTES), 0, 0};
+                DataCopyPad(slotGm_[(uint64_t)(t + i) * outputSlotBytes_], slot[i * SLOT_PAD], copyParams);
+            }
+        } else {
+            DataCopy(slotGm_[(uint64_t)t * SLOT_PAD], slot, cnt * SLOT_PAD);
+        }
         outQ_.FreeTensor(slot);
     }
 
@@ -196,6 +232,8 @@ private:
     GlobalTensor<float> centGm_;
     GlobalTensor<uint8_t> slotGm_;
     uint32_t numTokens_, tokStart_, tokEnd_, batch_;
+    uint32_t outputSlotBytes_ = SLOT_PAD;
+    bool compactCorrected_ = false;
     float bnd_[N_CENT];
     float normScalar_[MAX_TOKENS_PER_BATCH];
 };

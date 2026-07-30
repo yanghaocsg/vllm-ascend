@@ -273,6 +273,7 @@ struct ConstInfo {
     uint32_t cmpMaskMode = 0;
     uint32_t oriKvStride = 0;
     uint32_t cmpKvStride = 0;
+    uint32_t kvQuantMode = 0;
     bool needInit = false;
     uint32_t templateMode = 0;
 
@@ -313,6 +314,34 @@ struct ConstInfo {
     // 是否返回SoftmaxLse
     bool returnSoftmaxLse = false;
 };
+
+constexpr uint32_t TQ4_HEAD_DIM = 512U;
+constexpr uint32_t TQ4_PACKED_BYTES = 256U;
+constexpr uint32_t TQ4_SCALE_BYTES = sizeof(half);
+constexpr uint32_t TQ4_SLOT_BYTES = TQ4_PACKED_BYTES + TQ4_SCALE_BYTES;
+constexpr uint32_t TQ4_SLOT_ROW_BYTES = (TQ4_SLOT_BYTES + 31U) / 32U * 32U;
+constexpr float TQ4_CENTROID_BYTE_STRIDE = 4.0F;
+
+__aicore__ inline void LoadTq4Centroids(LocalTensor<float> centroids)
+{
+    centroids.SetValue(0, 0.00547294f);
+    centroids.SetValue(1, 0.01680406f);
+    centroids.SetValue(2, 0.02857605f);
+    centroids.SetValue(3, 0.04108622f);
+    centroids.SetValue(4, 0.05492980f);
+    centroids.SetValue(5, 0.07101817f);
+    centroids.SetValue(6, 0.09115373f);
+    centroids.SetValue(7, 0.12037795f);
+    centroids.SetValue(8, -0.12091285f);
+    centroids.SetValue(9, -0.09111122f);
+    centroids.SetValue(10, -0.07112455f);
+    centroids.SetValue(11, -0.05513602f);
+    centroids.SetValue(12, -0.04132067f);
+    centroids.SetValue(13, -0.02874970f);
+    centroids.SetValue(14, -0.01700489f);
+    centroids.SetValue(15, -0.00568677f);
+    PipeBarrier<PIPE_ALL>();
+}
 
 struct MSplitInfo {
     uint32_t nBufferIdx = 0U;
