@@ -9,11 +9,29 @@ from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowMLASpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheTensor,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+
+@dataclass
+class AscendPackedKVCacheTensor(KVCacheTensor):
+    """Physical KV page shared by logical layer views.
+
+    ``layer_offsets`` are byte offsets inside one physical page. The model
+    runner uses ``physical_page_size`` as the block stride when constructing
+    each logical view.
+    """
+
+    physical_page_size: int
+    layer_offsets: dict[str, int]
 
 
 def _get_c8_k_cache_dtype() -> torch.dtype:

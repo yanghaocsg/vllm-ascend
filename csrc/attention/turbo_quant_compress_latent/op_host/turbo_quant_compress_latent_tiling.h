@@ -16,6 +16,7 @@ BEGIN_TILING_DATA_DEF(TurboQuantCompressLatentTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, num_tokens);
 TILING_DATA_FIELD_DEF(uint32_t, tokens_per_core);
 TILING_DATA_FIELD_DEF(uint32_t, tokens_per_batch);
+TILING_DATA_FIELD_DEF(uint32_t, output_mode);
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(TurboQuantCompressLatent, TurboQuantCompressLatentTilingData)

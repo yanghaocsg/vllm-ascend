@@ -1081,7 +1081,8 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_meta(const at::Tenso
     const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_kv,
     const c10::optional<at::Tensor> &sinks, const c10::optional<at::Tensor> &metadata,
     double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode, int64_t ori_win_left,
-    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse)
+    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse,
+    int64_t kv_quant_mode)
 {
     std::string layout_q_str = std::string(layout_q);
     std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
@@ -1788,9 +1789,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(output, softmax_max, softmax_sum);
 }
 
-at::Tensor turbo_quant_compress_latent_meta(const at::Tensor &latent, const at::Tensor &centroids)
+at::Tensor turbo_quant_compress_latent_meta(
+    const at::Tensor &latent, const at::Tensor &centroids, int64_t output_mode)
 {
-    at::Tensor slot = at::empty({latent.size(0), 320}, latent.options().dtype(at::kByte));
+    TORCH_CHECK(output_mode == 0 || output_mode == 1,
+                "TurboQuant compression output_mode must be 0 or 1, got ", output_mode);
+    at::Tensor slot = at::empty(
+        {latent.size(0), output_mode == 1 ? 258 : 320}, latent.options().dtype(at::kByte));
     return slot;
 }
 } // namespace meta
