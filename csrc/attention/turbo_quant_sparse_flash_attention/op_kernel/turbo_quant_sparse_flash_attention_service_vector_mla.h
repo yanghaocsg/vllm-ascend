@@ -949,20 +949,38 @@ __aicore__ inline void QSFAVectorService<QSFAT>::MergeKv(const RunInfo &runInfo)
         WaitFlag<AscendC::HardEvent::V_MTE3>(0);
 
         DataCopyExtParams dataCopyParams;
-        dataCopyParams.blockCount = constInfo.headDim / blockElementNum;
-        dataCopyParams.blockLen = blockElementNum * sizeof(K_ROPE_T);
-        dataCopyParams.srcStride = 0;
-        dataCopyParams.dstStride = (constInfo.s2BaseSize - 1) * blockElementNum * sizeof(K_ROPE_T);
         uint64_t mergeGmStride = 512 * constInfo.combineHeadDim;
-        for (int64_t s2GmOffset = qsfaS2GmStartOffset + qsfaMte2Size; s2GmOffset < qsfaS2GmLimit; s2GmOffset++) {
-            DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * mergeGmStride + s2GmOffset * blockElementNum],
-                        mergeUb, dataCopyParams);
-        }
-        dataCopyParams.blockCount = constInfo.headDimRope / blockElementNum;
-        for (int64_t s2GmOffset = qsfaS2GmStartOffset + qsfaMte2Size; s2GmOffset < qsfaS2GmLimit; s2GmOffset++) {
-            DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * mergeGmStride + 512 * constInfo.headDim +
-                                   s2GmOffset * blockElementNum],
-                        mergeUb, dataCopyParams);
+        if (constInfo.keyQuantMode == QUANT_MODE::TQ4) {
+            // [TQ4] MergeKv lays a row out at row * combineHeadDim with nope and rope contiguous.
+            // The c8 fill in the else branch addresses a different layout and would zero live rows.
+            Duplicate(mergeUb, static_cast<K_ROPE_T>(0.0), constInfo.combineHeadDim);
+            SetFlag<AscendC::HardEvent::V_MTE3>(0);
+            WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+            dataCopyParams.blockCount = 1;
+            dataCopyParams.blockLen = constInfo.combineHeadDim * sizeof(K_ROPE_T);
+            dataCopyParams.srcStride = 0;
+            dataCopyParams.dstStride = 0;
+            for (int64_t s2GmOffset = qsfaS2GmStartOffset + qsfaMte2Size;
+                 s2GmOffset < qsfaS2GmLimit; s2GmOffset++) {
+                DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * mergeGmStride +
+                                       s2GmOffset * constInfo.combineHeadDim],
+                            mergeUb, dataCopyParams);
+            }
+        } else {
+            dataCopyParams.blockCount = constInfo.headDim / blockElementNum;
+            dataCopyParams.blockLen = blockElementNum * sizeof(K_ROPE_T);
+            dataCopyParams.srcStride = 0;
+            dataCopyParams.dstStride = (constInfo.s2BaseSize - 1) * blockElementNum * sizeof(K_ROPE_T);
+            for (int64_t s2GmOffset = qsfaS2GmStartOffset + qsfaMte2Size; s2GmOffset < qsfaS2GmLimit; s2GmOffset++) {
+                DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * mergeGmStride + s2GmOffset * blockElementNum],
+                            mergeUb, dataCopyParams);
+            }
+            dataCopyParams.blockCount = constInfo.headDimRope / blockElementNum;
+            for (int64_t s2GmOffset = qsfaS2GmStartOffset + qsfaMte2Size; s2GmOffset < qsfaS2GmLimit; s2GmOffset++) {
+                DataCopyPad(kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * mergeGmStride + 512 * constInfo.headDim +
+                                       s2GmOffset * blockElementNum],
+                            mergeUb, dataCopyParams);
+            }
         }
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(qsfaMergeMte3Idx & 1);
         qsfaMergeMte3Idx++;
