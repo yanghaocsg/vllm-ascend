@@ -15,9 +15,16 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     if (tokensPerCore < 1) tokensPerCore = 1;
     uint32_t blockDim = (numTokens + tokensPerCore - 1) / tokensPerCore;
 
+    // Batch no more than a core actually owns, otherwise cores would sit idle: at decode-shaped token
+    // counts this falls back to 1 and the kernel behaves exactly as it did before batching.
+    uint32_t tokensPerBatch = tokensPerCore;
+    if (tokensPerBatch > TQ_COMPRESS_MAX_TOKENS_PER_BATCH) tokensPerBatch = TQ_COMPRESS_MAX_TOKENS_PER_BATCH;
+    if (tokensPerBatch < 1) tokensPerBatch = 1;
+
     TurboQuantCompressLatentTilingData tilingData;
     tilingData.set_num_tokens(numTokens);
     tilingData.set_tokens_per_core(tokensPerCore);
+    tilingData.set_tokens_per_batch(tokensPerBatch);
 
     context->SetBlockDim(blockDim);
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),
