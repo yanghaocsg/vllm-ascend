@@ -138,20 +138,20 @@ def _get_kv_cache_groups_uniform_groups(
 
     # Split each SWA UniformKV group into smaller groups to align their #(layer tuples)
     # Possibly padding layer tuples for this.
-    # Additionally, we also pad KV blocks in each SWA layer, to align the page size
-    # with the corresponding layer in the full-MLA group.
-    all_page_sizes = full_mla_spec.get_page_sizes()
+    # Additionally, we pad smaller KV blocks to an existing full-MLA page size
+    # when possible. Some layouts (for example, TQ4 latent KV with FP32
+    # compressor state) have SWA pages larger than every full-MLA page. Those
+    # pages must keep their own size and are allocated in a separate bucket.
+    all_page_sizes = sorted(full_mla_spec.get_page_sizes())
     swa_mla_groups = []
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
-
         # Unify page size by padding layers' page_size to the nearest larger page_size.
         # Compute candidate (nearest larger page_size) for each unique page size.
         size_to_candidate: dict[int, int] = {}
         for ps in sm_page_sizes:
-            size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
+            size_to_candidate[ps] = next((x for x in all_page_sizes if x >= ps), ps)
         # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes
@@ -193,58 +193,41 @@ def _get_kv_cache_config_deepseek_v4(
 ) -> tuple[int, list[KVCacheTensor]]:
     """DeepseekV4 KV cache tensor layout planning.
 
-    Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
-    define the canonical bucket set. Non-full-MLA groups must have been
-    page_size-padded upstream (see _get_kv_cache_groups_uniform_groups) so
-    every layer's page_size matches one of the full-MLA bucket sizes.
-
-    For each group, bucket its layers by page_size_bytes and place each
-    layer at tuple_idx = position-within-bucket. Emit one KVCacheTensor
-    per (tuple_idx, bucket) whose shared_by is the union of per-group
-    layers at that slot.
+    For each group, bucket its layers by page_size_bytes and place each layer
+    at slot_idx = position-within-bucket. Layers from different groups at the
+    same slot can share a tensor because their block-table namespaces are
+    independent. MTP layers remain in dedicated tensors to avoid corrupting
+    main-model slot mappings.
     """
-    full_mla_spec = kv_cache_groups[0].kv_cache_spec
-    assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
-    page_sizes = sorted(full_mla_spec.get_page_sizes())
-    layer_tuple_page_bytes = sum(page_sizes)
-
-    # Pre-bucket each group's layers by page_size (registration order within
-    # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
-    mtp_layer_names = []
-    mtp_page_size = 0
-    bucketed: list[dict[int, list[str]]] = []
+    buckets: dict[int, list[list[str]]] = defaultdict(list)
+    mtp_layers: list[tuple[str, int]] = []
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
-        b: dict[int, list[str]] = defaultdict(list)
+        slot_count: dict[int, int] = defaultdict(int)
         for name in group.layer_names:
-            if "mtp" not in name:
-                b[specs[name].page_size_bytes].append(name)
-            else:
-                mtp_layer_names.append(name)
-                mtp_page_size = specs[name].page_size_bytes
-        bucketed.append(b)
+            page_size = specs[name].page_size_bytes
+            if "mtp" in name:
+                mtp_layers.append((name, page_size))
+                continue
+            slot_idx = slot_count[page_size]
+            slot_count[page_size] += 1
+            if slot_idx == len(buckets[page_size]):
+                buckets[page_size].append([])
+            buckets[page_size][slot_idx].append(name)
 
-    # num_layer_tuples = longest bucket list across all groups. For the
-    # full-MLA group this equals the count of layers in the largest
-    # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
-    # this equals the sub-group size (each has a single page_size).
-    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values()) + len(mtp_layer_names)
-
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    bytes_per_block = sum(page_size * len(slots) for page_size, slots in buckets.items())
+    bytes_per_block += sum(page_size for _, page_size in mtp_layers)
+    assert bytes_per_block > 0
+    num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
-    for tuple_idx in range(num_layer_tuples - len(mtp_layer_names)):
-        for ps in page_sizes:
-            shared_by: list[str] = []
-            for b in bucketed:
-                bucket = b.get(ps)
-                if bucket is not None and tuple_idx < len(bucket):
-                    shared_by.append(bucket[tuple_idx])
-            kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=shared_by))
-    for i in range(len(mtp_layer_names)):
-        kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
+    for page_size, slots in buckets.items():
+        for shared_by in slots:
+            kv_cache_tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by))
+    for name, page_size in mtp_layers:
+        kv_cache_tensors.append(KVCacheTensor(size=page_size * num_blocks, shared_by=[name]))
 
     return num_blocks, kv_cache_tensors
 

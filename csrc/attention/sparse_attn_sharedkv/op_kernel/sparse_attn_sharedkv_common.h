@@ -320,6 +320,7 @@ struct ConstInfo {
 constexpr uint32_t TQ4_HEAD_DIM = 512U;
 constexpr uint32_t TQ4_SLOT_BYTES = 320U;
 constexpr uint32_t TQ4_PACKED_BYTES = 256U;
+constexpr float TQ4_CENTROID_BYTE_STRIDE = 4.0F;
 
 __aicore__ inline void LoadTq4Centroids(LocalTensor<float> centroids)
 {
@@ -348,23 +349,27 @@ __aicore__ inline void DequantTq4Slot(LocalTensor<uint8_t> slot, LocalTensor<KV_
                                       LocalTensor<int32_t> indices, LocalTensor<float> centroids)
 {
     LocalTensor<int4b_t> packedCodes = slot.template ReinterpretCast<int4b_t>();
-    LocalTensor<uint16_t> slotU16 = slot.template ReinterpretCast<uint16_t>();
+    LocalTensor<half> slotHalf = slot.template ReinterpretCast<half>();
     LocalTensor<uint32_t> unsignedIndices = indices.template ReinterpretCast<uint32_t>();
+    LocalTensor<float> scale = indices[TQ4_HEAD_DIM].template ReinterpretCast<float>();
+    LocalTensor<float> scaleBrcb = scale[8];
 
     Cast(signedCodes, packedCodes, RoundMode::CAST_NONE, TQ4_HEAD_DIM);
     PipeBarrier<PIPE_V>();
     Adds(signedCodes, signedCodes, static_cast<half>(8.0f), TQ4_HEAD_DIM);
     PipeBarrier<PIPE_V>();
-    Muls(signedCodes, signedCodes, static_cast<half>(sizeof(float)), TQ4_HEAD_DIM);
+    Muls(signedCodes, signedCodes, static_cast<half>(TQ4_CENTROID_BYTE_STRIDE), TQ4_HEAD_DIM);
     PipeBarrier<PIPE_V>();
     Cast(indices, signedCodes, RoundMode::CAST_ROUND, TQ4_HEAD_DIM);
     PipeBarrier<PIPE_V>();
     Gather(work, centroids, unsignedIndices, 0, TQ4_HEAD_DIM);
     PipeBarrier<PIPE_V>();
 
-    uint16_t normBits = slotU16.GetValue(TQ4_PACKED_BYTES / sizeof(uint16_t));
-    half norm = *reinterpret_cast<half *>(&normBits);
-    Muls(work, work, static_cast<float>(norm), TQ4_HEAD_DIM);
+    Cast(scale, slotHalf[TQ4_PACKED_BYTES / sizeof(half)], RoundMode::CAST_NONE, 8);
+    PipeBarrier<PIPE_V>();
+    Brcb(scaleBrcb, scale, 1, {1, 8});
+    PipeBarrier<PIPE_V>();
+    Mul(work, work, scaleBrcb, 64, 8, {1, 1, 0, 8, 8, 0});
     PipeBarrier<PIPE_V>();
     if constexpr (IsSameType<KV_T, bfloat16_t>::value) {
         Cast(output, work, RoundMode::CAST_RINT, TQ4_HEAD_DIM);

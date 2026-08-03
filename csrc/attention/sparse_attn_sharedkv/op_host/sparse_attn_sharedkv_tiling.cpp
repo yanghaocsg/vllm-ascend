@@ -35,7 +35,7 @@ static const std::string METADATA_NAME = "metadata";
 static const std::string ATTEN_OUT_NAME = "attn_out";
 const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
     {QUERY_NAME,                  {ge::DT_FLOAT16, ge::DT_BF16}},
-    {ORI_KV_NAME,                    {ge::DT_FLOAT16, ge::DT_BF16, ge::DT_UINT8}},
+    {ORI_KV_NAME,                    {ge::DT_FLOAT16, ge::DT_BF16}},
     {CMP_KV_NAME,                  {ge::DT_FLOAT16, ge::DT_BF16, ge::DT_UINT8}},
     {ORI_SPARSE_INDICES,             {ge::DT_INT32}},
     {CMP_SPARSE_INDICES,               {ge::DT_INT32}},
@@ -818,8 +818,6 @@ void SASInfoParser::GenerateInfo(SASTilingInfo &sasInfo)
     sasInfo.returnSoftmaxLse = *opParamInfo_.returnSoftmaxLse;
     sasInfo.kvQuantMode = opParamInfo_.kvQuantMode == nullptr ? 0U : static_cast<uint32_t>(*opParamInfo_.kvQuantMode);
     if (sasInfo.kvQuantMode == 3) {
-        sasInfo.oriKvSlotCount = opParamInfo_.oriKv.tensor == nullptr ? 0U :
-            opParamInfo_.oriKv.tensor->GetStorageShape().GetShapeSize() / TQ4_SLOT_SIZE;
         sasInfo.cmpKvSlotCount = opParamInfo_.cmpKv.tensor == nullptr ? 0U :
             opParamInfo_.cmpKv.tensor->GetStorageShape().GetShapeSize() / TQ4_SLOT_SIZE;
     }
@@ -1350,19 +1348,18 @@ ge::graphStatus SASTilingCheck::CheckFeatureShape() const
     OP_CHECK_IF(qHeadDim_ != DIM_LIMIT,
                 OP_LOGE(opName_, "q_head_dim only support %u, but got %u", DIM_LIMIT, qHeadDim_),
                 return ge::GRAPH_FAILED);
-    const uint32_t expectedKvHeadDim = kvQuantMode_ == 3 ? TQ4_SLOT_SIZE : DIM_LIMIT;
-    OP_CHECK_IF(oriKvHeadDim_ != expectedKvHeadDim,
-                OP_LOGE(opName_, "ori_kv_head_dim only support %u when kv_quant_mode is %u, but got %u",
-                         expectedKvHeadDim, kvQuantMode_, oriKvHeadDim_),
+    OP_CHECK_IF(oriKvHeadDim_ != DIM_LIMIT,
+                OP_LOGE(opName_, "ori_kv_head_dim only support %u, but got %u", DIM_LIMIT, oriKvHeadDim_),
                 return ge::GRAPH_FAILED);
     if (!(sasInfo_.perfMode == SASTemplateMode::SWA_TEMPLATE_MODE)){
-        OP_CHECK_IF(cmpKvHeadDim_ != expectedKvHeadDim,
+        const uint32_t expectedCmpKvHeadDim = kvQuantMode_ == 3 ? TQ4_SLOT_SIZE : DIM_LIMIT;
+        OP_CHECK_IF(cmpKvHeadDim_ != expectedCmpKvHeadDim,
                     OP_LOGE(opName_, "cmp_kv_head_dim only support %u when kv_quant_mode is %u, but got %u",
-                             expectedKvHeadDim, kvQuantMode_, cmpKvHeadDim_),
+                             expectedCmpKvHeadDim, kvQuantMode_, cmpKvHeadDim_),
                     return ge::GRAPH_FAILED);
     }
 
-    OP_CHECK_IF(kvQuantMode_ == 0 && !(qType_ == oriKvType_),
+    OP_CHECK_IF(!(qType_ == oriKvType_),
                 OP_LOGE(opName_, "Head dimension data type check failed! qType[%s] must be the same with oriKvType[%s].",
                 SASDataTypeToSerialString(qType_).c_str(),
                 SASDataTypeToSerialString(oriKvType_).c_str()),
@@ -1370,14 +1367,11 @@ ge::graphStatus SASTilingCheck::CheckFeatureShape() const
     OP_CHECK_IF(kvQuantMode_ != 0 && kvQuantMode_ != 3,
                 OP_LOGE(opName_, "kv_quant_mode only supports 0 or 3, but got %u", kvQuantMode_),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ == 3 && oriKvType_ != ge::DT_UINT8,
-                OP_LOGE(opName_, "ori_kv must be DT_UINT8 when kv_quant_mode is 3."),
-                return ge::GRAPH_FAILED);
     OP_CHECK_IF(kvQuantMode_ == 3 && kvLayout_ != SASLayout::PA_ND,
                 OP_LOGE(opName_, "kv_quant_mode 3 only supports PA_ND KV layout."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.oriKvStride % TQ4_SLOT_SIZE != 0,
-                OP_LOGE(opName_, "ori_kv stride must be divisible by the 320-byte TQ slot size."),
+    OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.perfMode != SASTemplateMode::SCFA_TEMPLATE_MODE,
+                OP_LOGE(opName_, "kv_quant_mode 3 only supports the sparse compressor template."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.perfMode != SASTemplateMode::SWA_TEMPLATE_MODE &&
                     sasInfo_.cmpKvStride % TQ4_SLOT_SIZE != 0,
@@ -1482,8 +1476,8 @@ ge::graphStatus SASTilingCheck::CheckOriAndCmpKv() const
                         OP_LOGE(opName_, "cmp_kv cannot be empty tensor."),
                         return ge::GRAPH_FAILED);
         }
-        if (ge::GRAPH_SUCCESS != CheckDTypeConsistency(cmpKvType_,
-            oriKvType_, CMP_KV_NAME)) {
+        if (kvQuantMode_ == 0 && ge::GRAPH_SUCCESS != CheckDTypeConsistency(
+                cmpKvType_, oriKvType_, CMP_KV_NAME)) {
             return ge::GRAPH_FAILED;
         }
     }
@@ -1614,13 +1608,6 @@ ge::graphStatus SparseAttnSharedkvTiling::DoOpTiling(SASTilingInfo *tilingInfo)
         workspaceSize += 4 * 512 * 512 * 2 * aicNum; // 4:bufNum 512:s2Size  512:D 2:sizeof(half)
         workspaceSize += 4 * 128 * 4 * (2 * aicNum); // 4:缓存有效mte2 size长度 128:份数 4:512B对齐长度 2:aiv数量
     }
-    if (tilingInfo->kvQuantMode == 3) {
-        constexpr uint64_t LOGICAL_KV_BYTES = 512 * 2;
-        workspaceSize += tilingInfo->oriKvSlotCount * LOGICAL_KV_BYTES;
-        if (tilingInfo->perfMode != SASTemplateMode::SCFA_TEMPLATE_MODE) {
-            workspaceSize += tilingInfo->cmpKvSlotCount * LOGICAL_KV_BYTES;
-        }
-    }
     size_t *workSpaces = context_->GetWorkspaceSizes(1);
     workSpaces[0] = workspaceSize;
 
@@ -1639,9 +1626,7 @@ ge::graphStatus SparseAttnSharedkvTiling::DoOpTiling(SASTilingInfo *tilingInfo)
     tilingData_.baseParams.set_softmaxScale(tilingInfo->softmaxScale);
     tilingData_.baseParams.set_outputLayout(static_cast<uint32_t>(tilingInfo->outLayout));
     tilingData_.baseParams.set_oriMaskMode(tilingInfo->oriMaskMode);
-    const uint64_t oriKvStride = tilingInfo->kvQuantMode == 3 ?
-        tilingInfo->oriKvStride / TQ4_SLOT_SIZE * DIM_LIMIT : tilingInfo->oriKvStride;
-    tilingData_.baseParams.set_oriKvStride(oriKvStride);
+    tilingData_.baseParams.set_oriKvStride(tilingInfo->oriKvStride);
     tilingData_.baseParams.set_oriWinLeft(tilingInfo->oriWinLeft);
     tilingData_.baseParams.set_oriWinRight(tilingInfo->oriWinRight);
     tilingData_.baseParams.set_sparseBlockSize(tilingInfo->sparseBlockSize);

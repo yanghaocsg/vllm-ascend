@@ -72,6 +72,36 @@ log_selected_ops() {
     done
 }
 
+invalidate_stale_kernel_cache() {
+    local binary_root="build/binary/${SOC_ARG}"
+    local op_name
+    local op_path
+    local marker
+    local stale_source
+
+    [[ -d "${binary_root}/gen" ]] || return 0
+
+    for op_name in "${CUSTOM_OPS_ARRAY[@]}"; do
+        op_path=$(resolve_op_dir "${op_name}")
+        [[ -d "${op_path}/op_kernel" ]] || continue
+
+        stale_source=""
+        while IFS= read -r marker; do
+            stale_source=$(find "${op_path}/op_kernel" -type f -newer "${marker}" -print -quit)
+            [[ -z "${stale_source}" ]] || break
+        done < <(find "${binary_root}/gen" -maxdepth 1 -type f \
+            -name "${op_name}_${SOC_ARG}_*.done" -print)
+
+        [[ -z "${stale_source}" ]] && continue
+        log "invalidating stale kernel cache for ${op_name}: ${stale_source}"
+        find "${binary_root}/gen" -maxdepth 1 -type f \
+            -name "${op_name}_${SOC_ARG}_*.done" -delete
+        rm -rf -- "${binary_root}/bin/${op_name}" "${binary_root}/src/${op_name}"
+        find build/_CPack_Packages -type d -name "${op_name}" \
+            -path '*/op_impl/ai_core/*' -prune -exec rm -rf -- {} + 2>/dev/null || true
+    done
+}
+
 log "start: ROOT_DIR=${ROOT_DIR:-<unset>} SOC_VERSION=${SOC_VERSION:-<unset>} cwd=$(pwd)"
 log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
 
@@ -118,6 +148,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "vllm_quant_lightning_indexer_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
+        "compressor"
+        "compressor_metadata"
         "hc_pre_sinkhorn"
         "hc_pre_inv_rms"
         "hc_pre"
@@ -172,6 +204,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "vllm_quant_lightning_indexer_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
+        "compressor"
+        "compressor_metadata"
         "hc_pre_sinkhorn"
         "hc_pre_inv_rms"
         "hc_pre"
@@ -255,6 +289,10 @@ log_selected_ops
   log "subshell cwd after cd=$(pwd)"
   log "preserving csrc/build and cleaning output dirs"
   rm -rf -- output build_out
+  invalidate_stale_kernel_cache
+  # The manifest target only depends on its output directory, so it is not
+  # regenerated when an operator is newly added to an incremental build.
+  find build -type f \( -name binary_info_config.json -o -name relocatable_kernel_info_config.json \) -delete
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

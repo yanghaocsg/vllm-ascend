@@ -176,7 +176,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         if self.compress_ratio <= 1:  # SWA part. Allocated separately as DeepseekV4SWACache.
             return None
-        if get_ascend_config().enable_dsa_tq_latent:
+        if get_ascend_config().enable_dsa_tq_latent and self.compress_ratio == 4:
             device_type = get_ascend_device_type()
             if device_type not in {AscendDeviceType.A2, AscendDeviceType.A3}:
                 raise RuntimeError(

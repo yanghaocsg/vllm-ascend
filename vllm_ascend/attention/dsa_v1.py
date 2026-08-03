@@ -1431,7 +1431,9 @@ class AscendDSAImpl(DSAAttentionImpl):
         ascend_config = get_ascend_config()
         self.multistream_dsv4_dsa_overlap = ascend_config.multistream_dsv4_dsa_overlap
         self.vllm_config = get_current_vllm_config()
-        self.use_tq_latent = ascend_config.enable_dsa_tq_latent
+        # The fused DSV4 TQ4 path dequantizes sparse compressor slots on
+        # demand. CFA (compress_ratio=128) has no sparse slot-selection stage.
+        self.use_tq_latent = ascend_config.enable_dsa_tq_latent and self.compress_ratio == 4
         if self.use_tq_latent:
             if enable_dsa_cp():
                 raise RuntimeError("DeepSeek V4 TurboQuant KV cache does not support DSA context parallel yet.")
@@ -1562,9 +1564,16 @@ class AscendDSAImpl(DSAAttentionImpl):
     ) -> None:
         if kv.shape[0] == 0:
             return
-        if not self.use_tq_latent:
+        if cache.dtype != torch.uint8:
+            if self.use_tq_latent:
+                kv = _tq_store().had_fwd(
+                    kv.reshape(-1, DSA_TQ_HEAD_DIM),
+                    head_dim=DSA_TQ_HEAD_DIM,
+                ).view_as(kv)
             DeviceOperator.dsa_kv_compress_scatter(cache, kv, slot_mapping)
             return
+        if not self.use_tq_latent:
+            raise RuntimeError("DeepSeek V4 uint8 KV cache requires TurboQuant on a sparse compressor layer.")
         if cache.dtype != torch.uint8 or cache.shape[-1] != DSA_TQ_SLOT_SIZE:
             raise RuntimeError(
                 "DeepSeek V4 TurboQuant cache must use uint8 slots with width 320, "
