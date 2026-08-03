@@ -292,7 +292,9 @@ log_selected_ops
   invalidate_stale_kernel_cache
   # The manifest target only depends on its output directory, so it is not
   # regenerated when an operator is newly added to an incremental build.
-  find build -type f \( -name binary_info_config.json -o -name relocatable_kernel_info_config.json \) -delete
+  if [[ -d build ]]; then
+    find build -type f \( -name binary_info_config.json -o -name relocatable_kernel_info_config.json \) -delete
+  fi
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"

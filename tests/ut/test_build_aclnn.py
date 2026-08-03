@@ -30,5 +30,27 @@ def test_incremental_build_invalidates_stale_kernel_cache() -> None:
     assert '"${binary_root}/bin/${op_name}"' in build_script
     assert '"${binary_root}/src/${op_name}"' in build_script
     assert "-path '*/op_impl/ai_core/*'" in build_script
+    assert "if [[ -d build ]]" in build_script
     assert "-name binary_info_config.json" in build_script
     assert "-name relocatable_kernel_info_config.json" in build_script
+
+
+@pytest.mark.parametrize(
+    "op_name",
+    ["turbo_quant_sparse_flash_attention", "turbo_quant_compress_latent"],
+)
+def test_turboquant_ops_register_a2_and_a3(op_name: str) -> None:
+    op_def = Path(f"csrc/attention/{op_name}/op_host/{op_name}_def.cpp").read_text()
+
+    assert 'AddConfig("ascend910b"' in op_def
+    assert 'AddConfig("ascend910_93"' in op_def
+
+
+def test_turboquant_compress_tiling_uses_platform_core_count() -> None:
+    tiling_source = Path(
+        "csrc/attention/turbo_quant_compress_latent/op_host/turbo_quant_compress_latent_tiling.cpp"
+    ).read_text()
+
+    assert "GetCoreNumAiv()" in tiling_source
+    assert "CalcTschBlockDim" in tiling_source
+    assert "MAX_AI_CORES" not in tiling_source
