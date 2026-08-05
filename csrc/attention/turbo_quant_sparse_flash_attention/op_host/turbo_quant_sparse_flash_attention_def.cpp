@@ -68,6 +68,14 @@ public:
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT16, ge::DT_BF16})
             .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Output("softmax_max")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
+        this->Output("softmax_sum")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_FLOAT, ge::DT_FLOAT})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND});
         this->Attr("scale_value").AttrType(REQUIRED).Float(1.0);
         this->Attr("key_quant_mode").AttrType(REQUIRED).Int(1);
         this->Attr("value_quant_mode").AttrType(REQUIRED).Int(1);
@@ -81,6 +89,7 @@ public:
         this->Attr("quant_scale_repo_mode").AttrType(OPTIONAL).Int(1);
         this->Attr("tile_size").AttrType(OPTIONAL).Int(128);     // 128:默认�?
         this->Attr("rope_head_dim").AttrType(OPTIONAL).Int(64);  // 64:默认�?
+        this->Attr("return_softmax_lse").AttrType(OPTIONAL).Bool(false);
         OpAICoreConfig aicore_config;
         aicore_config.DynamicCompileStaticFlag(true)
             .DynamicFormatFlag(true)

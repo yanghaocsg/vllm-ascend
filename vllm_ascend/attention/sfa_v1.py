@@ -1559,17 +1559,16 @@ class AscendSFAImpl(MLAAttentionImpl):
     def _execute_sparse_flash_attention_process(
         self, ql_nope, q_pe, kv_cache, topk_indices, attn_metadata, actual_seq_lengths_query, actual_seq_lengths_key
     ):
-        kv = kv_cache[0]
-        if self.use_tq_latent:  # TQ4 4-bit latent: fused csrc op reads int8 directly
-            _ts = _tq_store()
-            _q = torch.cat([_ts.had_fwd(ql_nope, head_dim=self.kv_lora_rank), q_pe], dim=-1).contiguous()
-            _ao = torch.ops._C_ascend.turboquant_sparse_flash_attention(
-                _q, kv, kv, topk_indices, None, None, attn_metadata.block_table,
-                actual_seq_lengths_query, actual_seq_lengths_key,
-                float(self.scale), self.tq_key_quant_mode, self.tq_value_quant_mode, 1, "TND", "PA_BSND",
-                3, 9223372036854775807, 9223372036854775807, 2, 1, self.tq_tile_size,
-                self.qk_rope_head_dim)
-            return _ts.had_inv(_ao, head_dim=self.kv_lora_rank)
+        if self.use_tq_latent:
+            return self._execute_tq_sparse_flash_attention(
+                ql_nope,
+                q_pe,
+                kv_cache[0],
+                topk_indices,
+                attn_metadata.block_table,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+            )
         return DeviceOperator.execute_sparse_flash_attention_process(
             self,
             ql_nope,
@@ -1579,6 +1578,57 @@ class AscendSFAImpl(MLAAttentionImpl):
             attn_metadata,
             actual_seq_lengths_query,
             actual_seq_lengths_key,
+        )
+
+    def _execute_tq_sparse_flash_attention(
+        self,
+        ql_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv: torch.Tensor,
+        topk_indices: torch.Tensor,
+        block_table: torch.Tensor,
+        actual_seq_lengths_query: torch.Tensor,
+        actual_seq_lengths_key: torch.Tensor,
+        *,
+        sparse_mode: int = 3,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        tq_store = _tq_store()
+        query = torch.cat(
+            [tq_store.had_fwd(ql_nope, head_dim=self.kv_lora_rank), q_pe],
+            dim=-1,
+        ).contiguous()
+        attn_output, softmax_max, softmax_sum = torch.ops._C_ascend.turboquant_sparse_flash_attention(
+            query,
+            kv,
+            kv,
+            topk_indices,
+            None,
+            None,
+            block_table,
+            actual_seq_lengths_query,
+            actual_seq_lengths_key,
+            float(self.scale),
+            self.tq_key_quant_mode,
+            self.tq_value_quant_mode,
+            1,
+            "TND",
+            "PA_BSND",
+            sparse_mode,
+            9223372036854775807,
+            9223372036854775807,
+            2,
+            1,
+            self.tq_tile_size,
+            self.qk_rope_head_dim,
+            return_lse,
+        )
+        attn_output = tq_store.had_inv(attn_output, head_dim=self.kv_lora_rank)
+        return DeviceOperator._format_sparse_flash_attention_output(
+            attn_output,
+            softmax_max,
+            softmax_sum,
+            return_lse,
         )
 
     def _record_dcp_query_gather_context(

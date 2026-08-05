@@ -33,9 +33,15 @@ from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.turboquant.dsa import (
+    DSA_TQ_KV_QUANT_MODE,
+    restore_dsa_output,
+    transform_dsa_query,
+    validate_dsa_tq,
+    write_dsa_kv_cache,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
-    enable_dsa_cp,
     get_ascend_device_type,
     get_potential_max_tokens,
     npu_stream_switch,
@@ -58,18 +64,6 @@ BUILD_METADATA_STEP_PREFILL = 0
 BUILD_METADATA_STEP_DECODE = 1
 
 _DSV4_DSA_OVERLAP_STREAM = None
-
-DSA_TQ_HEAD_DIM = 512
-DSA_TQ_ROPE_HEAD_DIM = 64
-DSA_TQ_SLOT_SIZE = 320
-DSA_TQ_KV_QUANT_MODE = 3
-
-
-def _tq_store():
-    from vllm_ascend.turboquant import tq_latent_store
-
-    return tq_latent_store
-
 
 def dsv4_dsa_overlap_stream() -> torch.npu.Stream:
     global _DSV4_DSA_OVERLAP_STREAM
@@ -1434,20 +1428,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         # The fused DSV4 TQ4 path dequantizes sparse compressor slots on
         # demand. CFA (compress_ratio=128) has no sparse slot-selection stage.
         self.use_tq_latent = ascend_config.enable_dsa_tq_latent and self.compress_ratio == 4
-        if self.use_tq_latent:
-            if enable_dsa_cp():
-                raise RuntimeError("DeepSeek V4 TurboQuant KV cache does not support DSA context parallel yet.")
-            device_type = get_ascend_device_type()
-            if device_type not in {AscendDeviceType.A2, AscendDeviceType.A3}:
-                raise RuntimeError(
-                    "DeepSeek V4 TurboQuant KV cache is only supported on Ascend A2/A3, "
-                    f"got {device_type}."
-                )
-            if self.head_dim != DSA_TQ_HEAD_DIM or self.rope_head_dim != DSA_TQ_ROPE_HEAD_DIM:
-                raise ValueError(
-                    "DeepSeek V4 TurboQuant requires head_dim=512 and rope_head_dim=64, "
-                    f"got head_dim={self.head_dim}, rope_head_dim={self.rope_head_dim}."
-                )
+        validate_dsa_tq(self.use_tq_latent, self.head_dim, self.rope_head_dim)
 
         # indexer param
         if self.indexer is not None:
@@ -1562,44 +1543,13 @@ class AscendDSAImpl(DSAAttentionImpl):
         kv: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        if kv.shape[0] == 0:
-            return
-        if cache.dtype != torch.uint8:
-            if self.use_tq_latent:
-                kv = _tq_store().had_fwd(
-                    kv.reshape(-1, DSA_TQ_HEAD_DIM),
-                    head_dim=DSA_TQ_HEAD_DIM,
-                ).view_as(kv)
-            DeviceOperator.dsa_kv_compress_scatter(cache, kv, slot_mapping)
-            return
-        if not self.use_tq_latent:
-            raise RuntimeError("DeepSeek V4 uint8 KV cache requires TurboQuant on a sparse compressor layer.")
-        if cache.dtype != torch.uint8 or cache.shape[-1] != DSA_TQ_SLOT_SIZE:
-            raise RuntimeError(
-                "DeepSeek V4 TurboQuant cache must use uint8 slots with width 320, "
-                f"got dtype={cache.dtype}, shape={tuple(cache.shape)}."
-            )
-        packed_kv, workspace = _tq_store().compress_kernel(
-            kv.reshape(-1, DSA_TQ_HEAD_DIM),
-            head_dim=DSA_TQ_HEAD_DIM,
-        )
-        DeviceOperator.dsa_kv_compress_scatter(
-            cache,
-            packed_kv.view(-1, 1, DSA_TQ_SLOT_SIZE),
-            slot_mapping,
-        )
-        # Keep the Hadamard-space source alive until scatter has been queued.
-        del workspace
+        write_dsa_kv_cache(self.use_tq_latent, cache, kv, slot_mapping)
 
     def _transform_dsa_query(self, query: torch.Tensor) -> torch.Tensor:
-        if not self.use_tq_latent:
-            return query
-        return _tq_store().had_fwd(query, head_dim=DSA_TQ_HEAD_DIM)
+        return transform_dsa_query(self.use_tq_latent, query)
 
     def _restore_dsa_output(self, output: torch.Tensor) -> torch.Tensor:
-        if not self.use_tq_latent:
-            return output
-        return _tq_store().had_inv(output, head_dim=DSA_TQ_HEAD_DIM)
+        return restore_dsa_output(self.use_tq_latent, output)
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         # Attention impls are not walked by vllm's process_weights_after_loading

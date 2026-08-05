@@ -34,6 +34,8 @@ constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 7;
 constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 8;
 // Outputs Index
 constexpr uint32_t OUTPUT_INDEX = 0;
+constexpr uint32_t SOFTMAXMAX_INDEX = 1;
+constexpr uint32_t SOFTMAXSUM_INDEX = 2;
 // Attributes Index
 constexpr uint32_t SCALE_VALUE_ATTR_INDEX = 0;
 constexpr uint32_t KEY_QUANT_MODE_ATTR_INDEX = 1;
@@ -48,6 +50,7 @@ constexpr uint32_t ATTENTION_MODE_ATTR_INDEX = 9;
 constexpr uint32_t QUANT_SCALE_REPO_MODE_ATTR_INDEX = 10;
 constexpr uint32_t TILE_SIZE_ATTR_INDEX = 11;
 constexpr uint32_t ROPE_HEAD_DIM_ATTR_INDEX = 12;
+constexpr uint32_t RETURN_SOFTMAX_LSE_ATTR_INDEX = 13;
 // Dim Num
 constexpr size_t DIM_NUM_TWO = 2;
 constexpr size_t DIM_NUM_THREE = 3;
@@ -121,6 +124,8 @@ struct TQSFAParaInfo {
     TQSFAOptionalParaInfo keyDequantScale = {nullptr, nullptr};
     TQSFAOptionalParaInfo valueDequantScale = {nullptr, nullptr};
     TQSFARequiredParaInfo attenOut = {nullptr, nullptr};
+    TQSFARequiredParaInfo softmaxMax = {nullptr, nullptr};
+    TQSFARequiredParaInfo softmaxSum = {nullptr, nullptr};
 
     const char *layoutQuery = nullptr;
     const char *layoutKV = nullptr;
@@ -137,6 +142,7 @@ struct TQSFAParaInfo {
     const int64_t *ropeHeadDim = nullptr;
     const int64_t *preTokens = nullptr;
     const int64_t *nextTokens = nullptr;
+    const bool *returnSoftmaxLse = nullptr;
 };
 
 struct InnerSplitParams {
@@ -167,6 +173,7 @@ TILING_DATA_FIELD_DEF(int64_t, valueQuantMode)
 TILING_DATA_FIELD_DEF(int64_t, tileSize)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsNull)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsKVNull)
+TILING_DATA_FIELD_DEF(uint32_t, returnSoftmaxLse)
 END_TILING_DATA_DEF
 
 REGISTER_TILING_DATA_CLASS(TurboQuantSparseFlashAttentionBaseParamsMlaOp, TurboQuantSparseFlashAttentionBaseParamsMla)
@@ -255,6 +262,7 @@ struct TQSFATilingInfo {
     bool actualSeqLenFlag = false;
     bool isSameSeqAllKVTensor = true;
     bool isSameActualseq = true;
+    bool returnSoftmaxLse = false;
     uint32_t actualLenDimsKV = 0;
     std::vector<int64_t> kvListSeqLens {};
 

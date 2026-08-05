@@ -21,14 +21,20 @@ using namespace ge;
 
 namespace ops {
 constexpr size_t QUERY_INPUT_INDEX = 0;
+constexpr size_t KEY_INPUT_INDEX = 1;
 constexpr uint32_t LAYOUT_QUERY_ATTR_INDEX = 4;
+constexpr uint32_t LAYOUT_KV_ATTR_INDEX = 5;
 constexpr uint32_t ROPE_HEAD_DIM_ATTR_INDEX = 12;
+constexpr uint32_t RETURN_SOFTMAX_LSE_ATTR_INDEX = 13;
 constexpr uint32_t DIM_INDEX_0 = 0;
 constexpr uint32_t DIM_INDEX_1 = 1;
 constexpr uint32_t DIM_INDEX_2 = 2;
 constexpr uint32_t DIM_INDEX_3 = 3;
 constexpr uint32_t DIM_NUM_3 = 3;
 constexpr uint32_t DIM_NUM_4 = 4;
+constexpr uint32_t OUTPUT_INDEX_0 = 0;
+constexpr uint32_t OUTPUT_INDEX_1 = 1;
+constexpr uint32_t OUTPUT_INDEX_2 = 2;
 
 ge::graphStatus InferShapeTurboQuantSparseFlashAttention(gert::InferShapeContext *context)
 {
@@ -36,14 +42,24 @@ ge::graphStatus InferShapeTurboQuantSparseFlashAttention(gert::InferShapeContext
                return ge::GRAPH_FAILED);
     const gert::Shape *queryShape = context->GetInputShape(QUERY_INPUT_INDEX);
     OPS_LOG_E_IF_NULL(context, queryShape, return ge::GRAPH_FAILED)
-    gert::Shape *attentionOutShape = context->GetOutputShape(0);
+    const gert::Shape *keyShape = context->GetInputShape(KEY_INPUT_INDEX);
+    OPS_LOG_E_IF_NULL(context, keyShape, return ge::GRAPH_FAILED)
+    gert::Shape *attentionOutShape = context->GetOutputShape(OUTPUT_INDEX_0);
     OPS_LOG_E_IF_NULL(context, attentionOutShape, return ge::GRAPH_FAILED)
+    gert::Shape *softmaxMaxShape = context->GetOutputShape(OUTPUT_INDEX_1);
+    OPS_LOG_E_IF_NULL(context, softmaxMaxShape, return ge::GRAPH_FAILED)
+    gert::Shape *softmaxSumShape = context->GetOutputShape(OUTPUT_INDEX_2);
+    OPS_LOG_E_IF_NULL(context, softmaxSumShape, return ge::GRAPH_FAILED)
     auto attrs = context->GetAttrs();
     OPS_LOG_E_IF_NULL(context, attrs, return ge::GRAPH_FAILED)
     const char *inputLayoutQueryPtr = attrs->GetAttrPointer<char>(LAYOUT_QUERY_ATTR_INDEX);
     OPS_LOG_E_IF_NULL(context, inputLayoutQueryPtr, return ge::GRAPH_FAILED)
     std::string inputLayoutQueryPtrStr = std::string(inputLayoutQueryPtr);
+    const char *inputLayoutKvPtr = attrs->GetAttrPointer<char>(LAYOUT_KV_ATTR_INDEX);
+    OPS_LOG_E_IF_NULL(context, inputLayoutKvPtr, return ge::GRAPH_FAILED)
+    std::string inputLayoutKvPtrStr = std::string(inputLayoutKvPtr);
     const int64_t ropeHeadDim = *attrs->GetAttrPointer<int64_t>(ROPE_HEAD_DIM_ATTR_INDEX);
+    const bool returnSoftmaxLse = *attrs->GetAttrPointer<bool>(RETURN_SOFTMAX_LSE_ATTR_INDEX);
 
     *attentionOutShape = *queryShape;
     if (inputLayoutQueryPtrStr == "BSND") {
@@ -62,6 +78,29 @@ ge::graphStatus InferShapeTurboQuantSparseFlashAttention(gert::InferShapeContext
             attentionOutShape->SetDim(DIM_INDEX_2, queryShape->GetDim(DIM_INDEX_2) - ropeHeadDim); // 2:dim2
         }
     }
+    if (returnSoftmaxLse) {
+        if (inputLayoutQueryPtrStr == "TND") {
+            const uint32_t kvHeadIndex = inputLayoutKvPtrStr == "PA_BSND" ? DIM_INDEX_2 : DIM_INDEX_1;
+            softmaxMaxShape->SetDimNum(DIM_NUM_3);
+            softmaxMaxShape->SetDim(DIM_INDEX_0, keyShape->GetDim(kvHeadIndex));
+            softmaxMaxShape->SetDim(DIM_INDEX_1, queryShape->GetDim(DIM_INDEX_0));
+            softmaxMaxShape->SetDim(
+                DIM_INDEX_2, queryShape->GetDim(DIM_INDEX_1) / keyShape->GetDim(kvHeadIndex));
+            *softmaxSumShape = *softmaxMaxShape;
+        } else {
+            softmaxMaxShape->SetDimNum(DIM_NUM_4);
+            softmaxMaxShape->SetDim(DIM_INDEX_0, queryShape->GetDim(DIM_INDEX_0));
+            softmaxMaxShape->SetDim(DIM_INDEX_1, keyShape->GetDim(DIM_INDEX_2));
+            softmaxMaxShape->SetDim(DIM_INDEX_2, queryShape->GetDim(DIM_INDEX_1));
+            softmaxMaxShape->SetDim(
+                DIM_INDEX_3, queryShape->GetDim(DIM_INDEX_2) / keyShape->GetDim(DIM_INDEX_2));
+            *softmaxSumShape = *softmaxMaxShape;
+        }
+    } else {
+        softmaxMaxShape->SetDimNum(1);
+        softmaxMaxShape->SetDim(DIM_INDEX_0, 0);
+        *softmaxSumShape = *softmaxMaxShape;
+    }
     return GRAPH_SUCCESS;
 }
 
@@ -70,7 +109,9 @@ ge::graphStatus InferDataTypeTurboQuantSparseFlashAttention(gert::InferDataTypeC
     OPS_ERR_IF(context == nullptr, OPS_REPORT_VECTOR_INNER_ERR("TurboQuantSparseFlashAttention", "InferShapeContext invalid"),
                return ge::GRAPH_FAILED);
     const auto inputDataType = context->GetInputDataType(QUERY_INPUT_INDEX);
-    context->SetOutputDataType(0, inputDataType);
+    context->SetOutputDataType(OUTPUT_INDEX_0, inputDataType);
+    context->SetOutputDataType(OUTPUT_INDEX_1, ge::DT_FLOAT);
+    context->SetOutputDataType(OUTPUT_INDEX_2, ge::DT_FLOAT);
     return ge::GRAPH_SUCCESS;
 }
 

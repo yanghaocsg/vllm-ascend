@@ -67,7 +67,8 @@ public:
                                 __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
                                 __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable,
                                 __gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths,
-                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+                                __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax,
+                                __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
                                 const TurboQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
 				                __gm__ uint8_t *gmTiling, TPipe *tPipe);
 
@@ -132,6 +133,8 @@ private:
     GlobalTensor<K_ROPE_T> kRopeGm;
 
     GlobalTensor<OUT_T> attentionOutGm;
+    GlobalTensor<T> softmaxMaxGm;
+    GlobalTensor<T> softmaxSumGm;
     GlobalTensor<int32_t> blockTableGm;
     GlobalTensor<int32_t> topKGm;
 
@@ -206,6 +209,7 @@ template <typename QSFAT> __aicore__ inline void TurboQuantSparseFlashAttentionM
     constInfo.sparseBlockSize = tilingData->baseParams.sparseBlockSize;
     constInfo.sparseBlockCount = tilingData->baseParams.sparseBlockCount;
     constInfo.sparseMode = tilingData->baseParams.sparseMode;
+    constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
     constInfo.quantScaleRepoMode = QUANT_SCALE_REPO_MODE::COMBINE;
     constInfo.attentionMode = ATTENTION_MODE::MLA_ABSORB;
     constInfo.keyQuantMode = static_cast<QUANT_MODE>(tilingData->baseParams.keyQuantMode);
@@ -259,11 +263,23 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::InitAllZeroOutp
         uint64_t attenOutOffset = (tBase + s1Idx) * kvHeadNum * constInfo.gSize * constInfo.headDim +
                                     n2Idx * constInfo.gSize * constInfo.headDim;
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * constInfo.headDim, 0);
+        if (constInfo.returnSoftmaxLse) {
+            uint64_t offset = n2Idx * actualSeqLengthsQGm.GetValue(constInfo.batchSize - 1) * constInfo.gSize +
+                              (tBase + s1Idx) * constInfo.gSize;
+            matmul::InitOutput<T>(softmaxSumGm[offset], constInfo.gSize, 0);
+            matmul::InitOutput<T>(softmaxMaxGm[offset], constInfo.gSize, 0);
+        }
     } else if (constInfo.outputLayout == QSFA_LAYOUT::BSND) {
         uint64_t attenOutOffset = bIdx * constInfo.qSeqSize * kvHeadNum * constInfo.gSize * constInfo.headDim +
                                     s1Idx * kvHeadNum * constInfo.gSize * constInfo.headDim +
                                     n2Idx * constInfo.gSize * constInfo.headDim;
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * constInfo.headDim, 0);
+        if (constInfo.returnSoftmaxLse) {
+            uint64_t offset = bIdx * kvHeadNum * constInfo.qSeqSize * constInfo.gSize +
+                              n2Idx * constInfo.qSeqSize * constInfo.gSize + s1Idx * constInfo.gSize;
+            matmul::InitOutput<T>(softmaxSumGm[offset], constInfo.gSize, 0);
+            matmul::InitOutput<T>(softmaxMaxGm[offset], constInfo.gSize, 0);
+        }
     }
 }
 
@@ -280,6 +296,16 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::InitOutputSingl
         uint64_t qsfaSingleInitOutputSize = qsfaTailSize < qsfaSingleCoreSize ? qsfaTailSize : qsfaSingleCoreSize;
         if (tmpBlockIdx * qsfaSingleCoreSize < qsfaTotalOutputSize && qsfaSingleInitOutputSize > 0) {
             matmul::InitOutput<OUT_T>(attentionOutGm[tmpBlockIdx * qsfaSingleCoreSize], qsfaSingleInitOutputSize, 0);
+        }
+        if (constInfo.returnSoftmaxLse) {
+            uint64_t totalSize = constInfo.batchSize * constInfo.kvHeadNum * constInfo.qSeqSize * constInfo.gSize;
+            uint64_t singleCoreSize = (totalSize + (2 * qsfaCoreNum) - 1) / (2 * qsfaCoreNum);
+            uint64_t tailSize = totalSize - tmpBlockIdx * singleCoreSize;
+            uint64_t initSize = tailSize < singleCoreSize ? tailSize : singleCoreSize;
+            if (tmpBlockIdx * singleCoreSize < totalSize && initSize > 0) {
+                matmul::InitOutput<T>(softmaxSumGm[tmpBlockIdx * singleCoreSize], initSize, 0);
+                matmul::InitOutput<T>(softmaxMaxGm[tmpBlockIdx * singleCoreSize], initSize, 0);
+            }
         }
         SyncAll();
     }
@@ -406,7 +432,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
     __gm__ uint8_t *key, __gm__ uint8_t *value,
     __gm__ uint8_t *sparseIndices, __gm__ uint8_t* keyScale,
     __gm__ uint8_t* valueScale, __gm__ uint8_t *blockTable, __gm__ uint8_t *actualSeqLengthsQ,
-    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *workspace,
+    __gm__ uint8_t *actualSeqLengths, __gm__ uint8_t *attentionOut, __gm__ uint8_t *softmaxMax,
+    __gm__ uint8_t *softmaxSum, __gm__ uint8_t *workspace,
     const TurboQuantSparseFlashAttentionTilingDataMla *__restrict tiling,
     __gm__ uint8_t *gmTiling, TPipe *tPipe)
 {
@@ -436,6 +463,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
     valueGm.SetGlobalBuffer((__gm__ KV_T *)valuePtr);
 
     attentionOutGm.SetGlobalBuffer((__gm__ OUT_T *)attentionOut);
+    softmaxMaxGm.SetGlobalBuffer((__gm__ T *)softmaxMax);
+    softmaxSumGm.SetGlobalBuffer((__gm__ T *)softmaxSum);
 
     if ASCEND_IS_AIV {
         if (constInfo.needInit && LAYOUT_T != QSFA_LAYOUT::TND) {
@@ -504,7 +533,8 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
             vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm, sTGm_);
         }
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm,
-                                           actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm);
+                                           actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm,
+                                           softmaxMaxGm, softmaxSumGm);
         vectorService.InitVec2GlobalTensor(accumOutGm, vec2ResGm, mm2ResGm, attentionOutGm);
     }
 

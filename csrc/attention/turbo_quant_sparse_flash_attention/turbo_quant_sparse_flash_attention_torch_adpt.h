@@ -19,7 +19,7 @@
 
 namespace vllm_ascend {
 
-at::Tensor turboquant_sparse_flash_attention(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices,
     const c10::optional<at::Tensor> &key_dequant_scale,
@@ -30,7 +30,8 @@ at::Tensor turboquant_sparse_flash_attention(
     double scale_value, int64_t key_quant_mode, int64_t value_quant_mode,
     int64_t sparse_block_size, c10::string_view layout_query, c10::string_view layout_kv,
     int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t attention_mode,
-    int64_t quant_scale_repo_mode, int64_t tile_size, int64_t rope_head_dim)
+    int64_t quant_scale_repo_mode, int64_t tile_size, int64_t rope_head_dim,
+    bool return_softmax_lse)
 {
     std::string layout_query_str(layout_query);
     std::string layout_kv_str(layout_kv);
@@ -40,6 +41,15 @@ at::Tensor turboquant_sparse_flash_attention(
     auto query_shape = query.sizes();
     at::Tensor output = at::empty(
         {query_shape[0], query_shape[1], query_shape[2] - rope_head_dim}, query.options());
+    at::SmallVector<int64_t, 3> softmax_shape;
+    if (return_softmax_lse) {
+        const int64_t kv_head_num = key.size(2);
+        softmax_shape = {kv_head_num, query_shape[0], query_shape[1] / kv_head_num};
+    } else {
+        softmax_shape = {0};
+    }
+    at::Tensor softmax_max = at::empty(softmax_shape, query.options().dtype(at::kFloat));
+    at::Tensor softmax_sum = at::empty(softmax_shape, query.options().dtype(at::kFloat));
 
     EXEC_NPU_CMD(aclnnTurboQuantSparseFlashAttention,
                  query,
@@ -64,8 +74,11 @@ at::Tensor turboquant_sparse_flash_attention(
                  quant_scale_repo_mode,
                  tile_size,
                  rope_head_dim,
-                 output);
-    return output;
+                 return_softmax_lse,
+                 output,
+                 softmax_max,
+                 softmax_sum);
+    return {output, softmax_max, softmax_sum};
 }
 
 } // namespace vllm_ascend

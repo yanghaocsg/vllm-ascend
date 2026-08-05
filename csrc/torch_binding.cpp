@@ -2430,7 +2430,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                 int key_quant_mode, int value_quant_mode, int sparse_block_size, "
         "                                 str layout_query, str layout_kv, int sparse_mode, int pre_tokens, "
         "                                 int next_tokens, int attention_mode, int quant_scale_repo_mode, "
-        "                                 int tile_size, int rope_head_dim) -> Tensor"
+        "                                 int tile_size, int rope_head_dim, bool return_softmax_lse=False) "
+        "                                 -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("turboquant_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::turboquant_sparse_flash_attention);
     ops.def("turbo_quant_compress_latent(Tensor latent, Tensor centroids) -> Tensor");
