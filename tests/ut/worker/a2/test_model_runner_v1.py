@@ -38,6 +38,52 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.attn_backend = backend
         return runner
 
+    def test_adjust_kv_layout_uses_physical_stride_and_byte_offset(self):
+        runner = self._build_runner()
+        num_blocks = 2
+        block_size = 4
+        num_heads = 1
+        key_head_size = 3
+        scale_head_size = 1
+        layer_offset_bytes = 8
+        logical_page_size = block_size * (
+            key_head_size * torch.empty((), dtype=torch.uint8).element_size()
+            + scale_head_size * torch.empty((), dtype=torch.float16).element_size()
+        )
+        physical_page_size = logical_page_size * 2
+        raw_tensor = torch.zeros(
+            num_blocks * physical_page_size,
+            dtype=torch.int8,
+        )
+
+        key_cache, scale_cache = runner._adjust_kv_layout(
+            raw_tensor,
+            [
+                (num_blocks, block_size, num_heads, key_head_size),
+                (num_blocks, block_size, num_heads, scale_head_size),
+            ],
+            [torch.uint8, torch.float16],
+            physical_page_size,
+            storage_offset_bytes=layer_offset_bytes,
+        )
+
+        self.assertEqual(
+            key_cache.stride(0) * key_cache.element_size(),
+            physical_page_size,
+        )
+        self.assertEqual(
+            scale_cache.stride(0) * scale_cache.element_size(),
+            physical_page_size,
+        )
+        self.assertEqual(
+            key_cache.storage_offset() * key_cache.element_size(),
+            layer_offset_bytes,
+        )
+        self.assertEqual(
+            scale_cache.storage_offset() * scale_cache.element_size(),
+            layer_offset_bytes + block_size * num_heads * key_head_size,
+        )
+
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()
         kv_cache_spec = FullAttentionSpec(

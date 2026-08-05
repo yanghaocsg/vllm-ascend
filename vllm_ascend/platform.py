@@ -482,6 +482,15 @@ class NPUPlatform(Platform):
 
         ascend_config = init_ascend_config(vllm_config)
 
+        if (
+            ascend_config.enable_tq_latent
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            raise NotImplementedError(
+                "TurboQuant KV cache does not support vLLM DCP. "
+                "Use DSA-CP through additional_config.enable_dsa_cp instead."
+            )
+
         from vllm_ascend.logger import configure_ascend_file_logging
         from vllm_ascend.logger import configure_ascend_logging
 

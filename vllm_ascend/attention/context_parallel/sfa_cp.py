@@ -1261,30 +1261,19 @@ class AscendSFADCPImpl(AscendSFAImpl):
             # its local Q heads/tokens directly. In particular, DSA-CP keeps
             # its token shard local; no Q all-gather, sparse-index remap, LSE,
             # or output all-to-all merge is required.
-            if self.use_tq_latent:
-                attn_output = self._execute_tq_sparse_flash_attention(
-                    ql_nope,
-                    q_pe,
-                    gathered_kv_cache[0],
-                    topk_indices,
-                    block_table,
-                    actual_seq_lengths_query,
-                    actual_seq_lengths_key,
-                )
-            else:
-                attn_output = DeviceOperator.execute_sparse_flash_attention_process(
-                    self,
-                    ql_nope,
-                    q_pe,
-                    gathered_kv_cache,
-                    topk_indices,
-                    attn_metadata,
-                    actual_seq_lengths_query,
-                    actual_seq_lengths_key,
-                    block_table=block_table,
-                    sparse_mode=3,
-                    return_lse=False,
-                )
+            attn_output = DeviceOperator.execute_sparse_flash_attention_process(
+                self,
+                ql_nope,
+                q_pe,
+                gathered_kv_cache,
+                topk_indices,
+                attn_metadata,
+                actual_seq_lengths_query,
+                actual_seq_lengths_key,
+                block_table=block_table,
+                sparse_mode=3,
+                return_lse=False,
+            )
             return attn_output
 
         gather_context = dcp_context.gather_context
@@ -1301,36 +1290,23 @@ class AscendSFADCPImpl(AscendSFAImpl):
             topk_indices = self.dcp_group.all_gather(topk_indices.contiguous(), dim=0)
         topk_indices = self._remap_sparse_indices(topk_indices)
         ql_nope, q_pe = self._finish_dcp_gather(gather_context)
-        if self.use_tq_latent:
-            sfa_output, softmax_lse = self._execute_tq_sparse_flash_attention(
-                ql_nope,
-                q_pe,
-                kv_cache[0],
-                topk_indices,
-                dcp_context.block_table,
-                actual_seq_lengths_query,
-                dcp_context.seq_lens,
-                sparse_mode=0,
-                return_lse=True,
-            )
-        else:
-            sfa_output, softmax_lse = DeviceOperator.execute_sparse_flash_attention_process(
-                self,
-                ql_nope,
-                q_pe,
-                kv_cache,
-                topk_indices,
-                attn_metadata,
-                actual_seq_lengths_query,
-                dcp_context.seq_lens,
-                block_table=dcp_context.block_table,
-                # The replicated-view indexer already applies the causal visibility rule.
-                # After DCP remaps topk indices to local KV positions, local KV
-                # length no longer shares the same coordinate system as global
-                # query length, so SFA must not apply its right-down causal crop.
-                sparse_mode=0,
-                return_lse=True,
-            )
+        sfa_output, softmax_lse = DeviceOperator.execute_sparse_flash_attention_process(
+            self,
+            ql_nope,
+            q_pe,
+            kv_cache,
+            topk_indices,
+            attn_metadata,
+            actual_seq_lengths_query,
+            dcp_context.seq_lens,
+            block_table=dcp_context.block_table,
+            # The replicated-view indexer already applies the causal visibility rule.
+            # After DCP remaps topk indices to local KV positions, local KV
+            # length no longer shares the same coordinate system as global
+            # query length, so SFA must not apply its right-down causal crop.
+            sparse_mode=0,
+            return_lse=True,
+        )
         output_dtype = sfa_output.dtype
         output = self._merge_dcp_outputs(sfa_output, softmax_lse, attn_metadata.dsa_cp_context)
         return output.to(output_dtype)

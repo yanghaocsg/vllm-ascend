@@ -194,7 +194,11 @@ else:
 
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import (
+    AscendMLAAttentionSpec,
+    AscendPackedKVCacheTensor,
+    AscendSlidingWindowMLASpec,
+)
 
 # if true, allow tensor initialization and casting with internal format (e.g., NZ)
 torch.npu.config.allow_internal_format = True
@@ -4056,6 +4060,14 @@ class NPUModelRunner(GPUModelRunner):
                 if isinstance(layer_kv_cache_spec[layer_name], AttentionSpec):
                     use_attn = True
             self.hybrid_with_attn_and_mamba = self.hybrid_with_attn_and_mamba or (use_mamba and use_attn)
+            if isinstance(kv_cache_tensor, AscendPackedKVCacheTensor):
+                tensor = self._allocate_int8_cache_tensor(
+                    kv_cache_tensor.size,
+                    alignment,
+                )
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = tensor
+                continue
             for idx in range(len(kv_cache_tensor.shared_by)):
                 layer_name = kv_cache_tensor.shared_by[idx]
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
@@ -4264,13 +4276,14 @@ class NPUModelRunner(GPUModelRunner):
     def _adjust_kv_layout(
         self,
         raw_tensor: torch.Tensor,
-        kv_cache_shape_list: list[int],
-        kv_cache_dtype_list: list[int],
+        kv_cache_shape_list: list[tuple[int, ...]],
+        kv_cache_dtype_list: list[torch.dtype],
         page_size_bytes: int,
         overlap_full_kv_cache: bool = False,
+        storage_offset_bytes: int = 0,
     ):
         reshaped_kv_tensors = []
-        base_storage_offset_bytes = raw_tensor.storage_offset()
+        base_storage_offset_bytes = raw_tensor.storage_offset() + storage_offset_bytes
         storage_offset_bytes = base_storage_offset_bytes
         for idx, (shape, dtype) in enumerate(zip(kv_cache_shape_list, kv_cache_dtype_list)):
             if overlap_full_kv_cache and idx == 2:
@@ -4291,6 +4304,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             reshaped_kv_tensors.append(tensor)
             storage_offset_bytes += stride[0] * dtype_size
+        assert storage_offset_bytes - base_storage_offset_bytes <= page_size_bytes
         return reshaped_kv_tensors
 
 
@@ -4312,6 +4326,12 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        packed_layouts = {
+            layer_name: (tensor.physical_page_size, offset)
+            for tensor in kv_cache_config.kv_cache_tensors
+            if isinstance(tensor, AscendPackedKVCacheTensor)
+            for layer_name, offset in tensor.layer_offsets.items()
+        }
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
@@ -4326,11 +4346,17 @@ class NPUModelRunner(GPUModelRunner):
                 if self.use_compress and isinstance(current_kv_cache_spec,
                                                     (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
                     kv_tensor = kv_cache_raw_tensors[layer_name]
-                    sum_page_size_bytes = kv_tensor.numel()
-                    num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
-                    assert num_blocks == kv_cache_config.num_blocks, \
-                        f"num_blocks: {num_blocks} should be equal to " \
-                        f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
+                    packed_layout = packed_layouts.get(layer_name)
+                    if packed_layout is None:
+                        page_size_bytes = current_kv_cache_spec.page_size_bytes
+                        num_blocks = kv_tensor.numel() // page_size_bytes
+                        storage_offset_bytes = 0
+                        assert num_blocks == kv_cache_config.num_blocks, \
+                            f"num_blocks: {num_blocks} should be equal to " \
+                            f"kv_cache_config.num_blocks: {kv_cache_config.num_blocks}"
+                    else:
+                        page_size_bytes, storage_offset_bytes = packed_layout
+                        num_blocks = kv_cache_config.num_blocks
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, current_kv_cache_spec.block_size,
                         current_kv_cache_spec.num_kv_heads,
@@ -4372,8 +4398,9 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache = self._adjust_kv_layout(kv_tensor,
                                            kv_cache_shape_list,
                                            kv_cache_dtype_list,
-                                           current_kv_cache_spec.page_size_bytes,
+                                           page_size_bytes,
                                            overlap_full_kv_cache=overlap_full_kv_cache,
+                                           storage_offset_bytes=storage_offset_bytes,
                                            )
 
                     kv_caches[layer_name] = kv_cache
