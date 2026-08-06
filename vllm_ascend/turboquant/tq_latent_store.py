@@ -38,6 +38,7 @@ ROPE_HEAD_DIM = 64
 SCALE_BYTES = 2
 SLOT_ALIGN = 64
 ROPE_DTYPE_BYTES = 2
+NORM_SQUARED_EPS = 1e-16
 
 
 def _is_power_of_2(n):
@@ -182,3 +183,27 @@ def lutsq(device, head_dim=HEAD_DIM):
     per-nibble bitwise unpack -> graph-capture safe (gather+sum only, no RightShift/And aclop)."""
     _build(device, head_dim)
     return _LUTSQ
+
+
+def apply_code_norm_correction(slot, head_dim=HEAD_DIM):
+    """Replace a raw vector norm with the per-slot code-norm-corrected scale."""
+    head_dim = int(head_dim)
+    packed = packed_bytes(head_dim)
+    if slot.ndim != 2 or slot.shape[-1] < packed + SCALE_BYTES:
+        raise ValueError(
+            "TQ slot must be a rank-2 tensor containing packed codes and an FP16 scale, "
+            f"got shape={tuple(slot.shape)}, head_dim={head_dim}."
+        )
+
+    codes = slot[:, :packed]
+    norm_bytes = slot[:, packed : packed + SCALE_BYTES]
+    raw_norm = norm_bytes.contiguous().view(torch.float16).float().view(-1, 1)
+    inverse_code_norm = torch.rsqrt(
+        lutsq(codes.device, head_dim=head_dim)[codes.long()].sum(-1, keepdim=True) + NORM_SQUARED_EPS
+    )
+    corrected_scale = (raw_norm * inverse_code_norm).to(torch.float16)
+    corrected_scale_bytes = corrected_scale.contiguous().view(torch.uint8).view(-1, SCALE_BYTES)
+    return torch.cat(
+        [codes, corrected_scale_bytes, slot[:, packed + SCALE_BYTES :]],
+        dim=-1,
+    )

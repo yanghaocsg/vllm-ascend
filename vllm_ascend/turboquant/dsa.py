@@ -54,10 +54,13 @@ def write_dsa_kv_cache(
             "DeepSeek V4 TurboQuant cache must use uint8 slots with width 320, "
             f"got dtype={cache.dtype}, shape={tuple(cache.shape)}."
         )
-    packed_kv, workspace = _tq_store().compress_kernel(
+    tq_store = _tq_store()
+    packed_kv, workspace = tq_store.compress_kernel(
         kv.reshape(-1, DSA_TQ_HEAD_DIM),
         head_dim=DSA_TQ_HEAD_DIM,
     )
+    # The shared compressor returns a raw norm because GLM applies its own fused-slot correction.
+    packed_kv = tq_store.apply_code_norm_correction(packed_kv, head_dim=DSA_TQ_HEAD_DIM)
     DeviceOperator.dsa_kv_compress_scatter(
         cache,
         packed_kv.view(-1, 1, DSA_TQ_SLOT_SIZE),
