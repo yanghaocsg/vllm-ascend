@@ -485,8 +485,10 @@ __aicore__ inline void TurboQuantSparseFlashAttentionMla<QSFAT>::Init(__gm__ uin
                                    constInfo.combineHeadDim * 4 * sizeof(K_ROPE_T)));
         qsfaOffset += GetBlockNum() * 512 * constInfo.combineHeadDim * 4 * sizeof(K_ROPE_T);
 
+        // 每核占 2048 个 int32：[0,1024) 为 kvValidSize，[1024,2048) 为 [TQ4] per-column scale
+        // （按 half 视图是 [2048,4096)，布局 slot(loop%4) × s2BaseSize(512)）。
         kvValidSizeGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)(workspace + qsfaOffset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
+            (__gm__ int32_t *)(workspace + qsfaOffset + (aiCoreIdx * 4) * 128 * 4 * sizeof(int32_t)));
     }
 
     if constexpr (FLASH_DECODE) {

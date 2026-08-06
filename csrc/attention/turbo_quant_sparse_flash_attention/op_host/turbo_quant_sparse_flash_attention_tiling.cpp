@@ -375,7 +375,8 @@ void TQSFAMlaTiling::GetWorkspaceSize()
     workspaceSize_ += preLoadNum * mBaseSize_ * actCoreNum * softmaxSumElemSize;
     workspaceSize_ += preLoadNum * bmm2ResUbSize_ * actCoreNum * bmm2ResElemSize; // vec2ResGm
     workspaceSize_ += 4 * 512 * qsfaInfo_->qHeadDim * NUM_BYTES_FLOAT16 * actCoreNum;
-    workspaceSize_ += 4 * 128 * 4 * (2 * actCoreNum);
+    // [TQ4 O8O9] kvValidSize 区扩一倍，上半区放 per-column scale（4槽 x 512 half）
+    workspaceSize_ += 4 * 128 * 4 * (4 * actCoreNum);
 
     CalcFDWorkSpace(actCoreNum);
 }
