@@ -99,7 +99,7 @@ constexpr uint32_t ATTR_LAYOUT_Q_INDEX = 8;
 constexpr uint32_t ATTR_LAYOUT_KV_INDEX = 9;
 constexpr uint32_t ATTR_RETURN_SOFTMAX_LSE = 10;
 constexpr uint32_t ATTR_KV_QUANT_MODE_INDEX = 11;
-constexpr uint32_t TQ4_SLOT_SIZE = 320;
+constexpr uint32_t TQ4_SLOT_SIZE = 258;
 
 // Dim Index
 constexpr uint32_t DIM_IDX_ONE = 1;

@@ -7,9 +7,17 @@ static ge::graphStatus InferShape4TurboQuantCompressLatent(gert::InferShapeConte
     const gert::Shape* latentShape = context->GetInputShape(0);
     int64_t N = latentShape->GetDim(0);
     gert::Shape* slotShape = context->GetOutputShape(0);
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    if (attrs == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    const int64_t* outputModeAttr = attrs->GetAttrPointer<int64_t>(0);
+    if (outputModeAttr == nullptr || (*outputModeAttr != 0 && *outputModeAttr != 1)) {
+        return ge::GRAPH_FAILED;
+    }
     slotShape->SetDimNum(2);
     slotShape->SetDim(0, N);
-    slotShape->SetDim(1, 320);   // SLOT_PAD
+    slotShape->SetDim(1, *outputModeAttr == 1 ? 258 : 320);
     return ge::GRAPH_SUCCESS;
 }
 

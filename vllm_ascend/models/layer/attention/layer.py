@@ -24,6 +24,7 @@ from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.turboquant.dsa import DSA_TQ_SLOT_SIZE
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_device_type,
@@ -186,7 +187,7 @@ class DSAAttention(nn.Module, AttentionLayerBase):
             return AscendMLAAttentionSpec(
                 block_size=DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0],
                 num_kv_heads=1,
-                head_size=320,
+                head_size=DSA_TQ_SLOT_SIZE,
                 dtype=torch.uint8,
                 model_version="deepseek_v4",
                 compress_ratio=self.compress_ratio,

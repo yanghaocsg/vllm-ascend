@@ -5,7 +5,8 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 DSA_TQ_HEAD_DIM = 512
 DSA_TQ_ROPE_HEAD_DIM = 64
-DSA_TQ_SLOT_SIZE = 320
+DSA_TQ_SCALE_BYTES = 2
+DSA_TQ_SLOT_SIZE = DSA_TQ_HEAD_DIM // 2 + DSA_TQ_SCALE_BYTES
 DSA_TQ_KV_QUANT_MODE = 3
 
 
@@ -51,16 +52,15 @@ def write_dsa_kv_cache(
         raise RuntimeError("DeepSeek V4 uint8 KV cache requires TurboQuant on a sparse compressor layer.")
     if cache.shape[-1] != DSA_TQ_SLOT_SIZE:
         raise RuntimeError(
-            "DeepSeek V4 TurboQuant cache must use uint8 slots with width 320, "
+            f"DeepSeek V4 TurboQuant cache must use uint8 slots with width {DSA_TQ_SLOT_SIZE}, "
             f"got dtype={cache.dtype}, shape={tuple(cache.shape)}."
         )
     tq_store = _tq_store()
     packed_kv, workspace = tq_store.compress_kernel(
         kv.reshape(-1, DSA_TQ_HEAD_DIM),
         head_dim=DSA_TQ_HEAD_DIM,
+        output_mode=tq_store.COMPRESS_OUTPUT_COMPACT_CORRECTED,
     )
-    # The shared compressor returns a raw norm because GLM applies its own fused-slot correction.
-    packed_kv = tq_store.apply_code_norm_correction(packed_kv, head_dim=DSA_TQ_HEAD_DIM)
     DeviceOperator.dsa_kv_compress_scatter(
         cache,
         packed_kv.view(-1, 1, DSA_TQ_SLOT_SIZE),

@@ -75,6 +75,8 @@ public:
                                     int64_t realS2Idx2, const RunInfo &runInfo);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
+    __aicore__ inline void DequantTq4Rows(LocalTensor<uint8_t> slots, LocalTensor<KV_T> output,
+                                          int64_t rowCount);
     __aicore__ inline void CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
                                           int64_t keyBNBOffset, int64_t s2IdLimit, const RunInfo &runInfo);
     // ================================Vector1==========================================
@@ -138,6 +140,30 @@ private:
     static constexpr uint32_t BASE_BLOCK_MAX_ELEMENT_NUM = ConstInfo::BUFFER_SIZE_BYTE_32K / sizeof(T); // 32768/4=8096
     static constexpr uint32_t BLOCK_ELEMENT_NUM = BYTE_BLOCK / sizeof(T);                               // 32/4=8
     static constexpr uint32_t MAX_N1_SIZE = 128U;
+    // tmpBuff1: batched work/codes/indices, scale broadcast scratch, then two aligned raw-slot regions.
+    static constexpr uint32_t TQ4_MAX_STAGED_ROWS =
+        INPUT2_BUFFER_OFFSET / (TQ4_HEAD_DIM * sizeof(KV_T));
+    static constexpr uint32_t TQ4_RAW_REGION_BYTES = TQ4_MAX_STAGED_ROWS * TQ4_SLOT_ROW_BYTES;
+    static constexpr uint32_t TQ4_RAW_BUFFER_BYTES = 2U * TQ4_RAW_REGION_BYTES;
+    static constexpr uint32_t TQ4_SCALE_SOURCE_BYTES = ConstInfo::BUFFER_SIZE_BYTE_32B;
+    static constexpr uint32_t TQ4_SCALE_BROADCAST_BYTES = ConstInfo::BUFFER_SIZE_BYTE_256B;
+    static constexpr uint32_t TQ4_SCALE_SCRATCH_BYTES =
+        TQ4_SCALE_SOURCE_BYTES + TQ4_SCALE_BROADCAST_BYTES;
+    static constexpr uint32_t TQ4_DEQUANT_BYTES_PER_ROW =
+        TQ4_HEAD_DIM * (sizeof(float) + sizeof(half) + sizeof(int32_t));
+    static constexpr uint32_t TQ4_DEQUANT_BATCH_ROWS =
+        (ConstInfo::BUFFER_SIZE_BYTE_32K - TQ4_RAW_BUFFER_BYTES - TQ4_SCALE_SCRATCH_BYTES) /
+        TQ4_DEQUANT_BYTES_PER_ROW;
+    static constexpr uint32_t TQ4_WORK_BYTES = TQ4_DEQUANT_BATCH_ROWS * TQ4_HEAD_DIM * sizeof(float);
+    static constexpr uint32_t TQ4_SIGNED_BYTES = TQ4_DEQUANT_BATCH_ROWS * TQ4_HEAD_DIM * sizeof(half);
+    static constexpr uint32_t TQ4_INDEX_BYTES = TQ4_DEQUANT_BATCH_ROWS * TQ4_HEAD_DIM * sizeof(int32_t);
+    static constexpr uint32_t TQ4_SIGNED_OFFSET = TQ4_WORK_BYTES;
+    static constexpr uint32_t TQ4_INDEX_OFFSET = TQ4_SIGNED_OFFSET + TQ4_SIGNED_BYTES;
+    static constexpr uint32_t TQ4_SCALE_OFFSET = TQ4_INDEX_OFFSET + TQ4_INDEX_BYTES;
+    static constexpr uint32_t TQ4_RAW_OFFSET = TQ4_SCALE_OFFSET + TQ4_SCALE_SCRATCH_BYTES;
+    static_assert(TQ4_DEQUANT_BATCH_ROWS > 0U, "TQ4 dequant scratch cannot hold one row");
+    static_assert(TQ4_RAW_OFFSET + TQ4_RAW_BUFFER_BYTES <= ConstInfo::BUFFER_SIZE_BYTE_32K,
+                  "TQ4 batched dequant scratch exceeds tmpBuff1");
     static constexpr T SOFTMAX_MIN_NUM = -2e38;
     static constexpr SINKS_T R0 = 1.0f;
 
@@ -574,6 +600,59 @@ __aicore__ inline int64_t SASVectorBlock<SAST>::GetKeyGmOffset(int64_t realS2Idx
 }
 
 template <typename SAST>
+__aicore__ inline void SASVectorBlock<SAST>::DequantTq4Rows(LocalTensor<uint8_t> slots,
+                                                            LocalTensor<KV_T> output, int64_t rowCount)
+{
+    LocalTensor<float> work = tmpBuff1.Get<float>();
+    LocalTensor<half> signedCodes = tmpBuff1.Get<half>()[TQ4_SIGNED_OFFSET / sizeof(half)];
+    LocalTensor<int32_t> indices = tmpBuff1.Get<int32_t>()[TQ4_INDEX_OFFSET / sizeof(int32_t)];
+    LocalTensor<uint32_t> unsignedIndices = indices.template ReinterpretCast<uint32_t>();
+    LocalTensor<float> scale = tmpBuff1.Get<float>()[TQ4_SCALE_OFFSET / sizeof(float)];
+    LocalTensor<float> scaleBrcb = scale[8];
+    LocalTensor<float> centroids = tqCentBuff.Get<float>();
+    LocalTensor<int4b_t> packedCodes = slots.template ReinterpretCast<int4b_t>();
+    LocalTensor<half> slotHalf = slots.template ReinterpretCast<half>();
+
+    for (int64_t base = 0; base < rowCount; base += TQ4_DEQUANT_BATCH_ROWS) {
+        uint32_t currentRows = static_cast<uint32_t>(
+            base + TQ4_DEQUANT_BATCH_ROWS <= rowCount ? TQ4_DEQUANT_BATCH_ROWS : rowCount - base);
+        uint32_t elementCount = currentRows * TQ4_HEAD_DIM;
+        for (uint32_t row = 0; row < currentRows; ++row) {
+            uint32_t sourceRow = static_cast<uint32_t>(base) + row;
+            Cast(signedCodes[row * TQ4_HEAD_DIM],
+                 packedCodes[sourceRow * TQ4_SLOT_ROW_BYTES * 2U], RoundMode::CAST_NONE, TQ4_HEAD_DIM);
+        }
+        PipeBarrier<PIPE_V>();
+        Adds(signedCodes, signedCodes, static_cast<half>(8.0f), elementCount);
+        PipeBarrier<PIPE_V>();
+        Muls(signedCodes, signedCodes, static_cast<half>(TQ4_CENTROID_BYTE_STRIDE), elementCount);
+        PipeBarrier<PIPE_V>();
+        Cast(indices, signedCodes, RoundMode::CAST_ROUND, elementCount);
+        PipeBarrier<PIPE_V>();
+        Gather(work, centroids, unsignedIndices, 0, elementCount);
+        PipeBarrier<PIPE_V>();
+
+        for (uint32_t row = 0; row < currentRows; ++row) {
+            uint32_t sourceRow = static_cast<uint32_t>(base) + row;
+            Cast(scale, slotHalf[sourceRow * TQ4_SLOT_ROW_BYTES / sizeof(half) +
+                                 TQ4_PACKED_BYTES / sizeof(half)], RoundMode::CAST_NONE, 8);
+            PipeBarrier<PIPE_V>();
+            Brcb(scaleBrcb, scale, 1, {1, 8});
+            PipeBarrier<PIPE_V>();
+            Mul(work[row * TQ4_HEAD_DIM], work[row * TQ4_HEAD_DIM], scaleBrcb,
+                TQ4_HEAD_DIM / 8, 8, {1, 1, 0, 8, 8, 0});
+            PipeBarrier<PIPE_V>();
+        }
+        if constexpr (IsSameType<KV_T, bfloat16_t>::value) {
+            Cast(output[base * TQ4_HEAD_DIM], work, RoundMode::CAST_RINT, elementCount);
+        } else {
+            Cast(output[base * TQ4_HEAD_DIM], work, RoundMode::CAST_ROUND, elementCount);
+        }
+        PipeBarrier<PIPE_V>();
+    }
+}
+
+template <typename SAST>
 __aicore__ inline void SASVectorBlock<SAST>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
                                                             int64_t realS2Idx, int64_t keyBNBOffset, int64_t s2IdLimit,
                                                             const RunInfo &runInfo)
@@ -582,22 +661,18 @@ __aicore__ inline void SASVectorBlock<SAST>::CopyInSingleKv(int64_t &mte2Size, i
         return;
     }
     if (constInfo.kvQuantMode == 3) {
-        LocalTensor<uint8_t> slot = tmpBuff1.Get<uint8_t>()[ConstInfo::BUFFER_SIZE_BYTE_8K];
-        LocalTensor<KV_T> output = kvMergUb_[
-            mergeMte3Idx % 2 * INPUT2_BUFFER_OFFSET / sizeof(KV_T) +
-            (mte2Size - mte3Size) * constInfo.headDim];
-        LocalTensor<float> work = tmpBuff1.Get<float>();
-        LocalTensor<half> signedCodes = tmpBuff1.Get<half>()[ConstInfo::BUFFER_SIZE_BYTE_2K / sizeof(half)];
-        LocalTensor<int32_t> indices = tmpBuff1.Get<int32_t>()[
-            (ConstInfo::BUFFER_SIZE_BYTE_2K + ConstInfo::BUFFER_SIZE_BYTE_1K) / sizeof(int32_t)];
-
-        SetFlag<HardEvent::V_MTE2>(0);
-        WaitFlag<HardEvent::V_MTE2>(0);
-        DataCopy(slot, cmpTqGm_[keyBNBOffset], TQ4_SLOT_BYTES);
-        SetFlag<HardEvent::MTE2_V>(0);
-        WaitFlag<HardEvent::MTE2_V>(0);
-        DequantTq4Slot(slot, output, work, signedCodes, indices,
-                      tqCentBuff.Get<float>());
+        int64_t stagedRow = mte2Size - mte3Size;
+        if (stagedRow == 0) {
+            SetFlag<HardEvent::V_MTE2>(0);
+            WaitFlag<HardEvent::V_MTE2>(0);
+        }
+        LocalTensor<uint8_t> slot = tmpBuff1.Get<uint8_t>()[
+            TQ4_RAW_OFFSET + mergeMte3Idx % 2 * TQ4_RAW_REGION_BYTES +
+            stagedRow * TQ4_SLOT_ROW_BYTES];
+        DataCopyExtParams copyParams{1, TQ4_SLOT_BYTES, 0, 0};
+        DataCopyPadExtParams<uint8_t> padParams{
+            true, 0, static_cast<uint8_t>(TQ4_SLOT_ROW_BYTES - TQ4_SLOT_BYTES), 0};
+        DataCopyPad(slot, cmpTqGm_[keyBNBOffset], copyParams, padParams);
         ++mte2Size;
         return;
     }
@@ -692,6 +767,13 @@ __aicore__ inline void SASVectorBlock<SAST>::CopyOutMrgeResult(int64_t mte2Size,
         return;
     }
     if (constInfo.kvQuantMode == 3) {
+        SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+        LocalTensor<uint8_t> slots = tmpBuff1.Get<uint8_t>()[
+            TQ4_RAW_OFFSET + mergeMte3Idx % 2 * TQ4_RAW_REGION_BYTES];
+        LocalTensor<KV_T> output = kvMergUb_[
+            mergeMte3Idx % 2 * INPUT2_BUFFER_OFFSET / sizeof(KV_T)];
+        DequantTq4Rows(slots, output, mte2Size - mte3Size);
         SetFlag<AscendC::HardEvent::V_MTE3>(mergeMte3Idx % 2 + SYNC_INPUT_BUF2_FLAG);
         WaitFlag<AscendC::HardEvent::V_MTE3>(mergeMte3Idx % 2 + SYNC_INPUT_BUF2_FLAG);
     } else {
@@ -744,7 +826,7 @@ __aicore__ inline void SASVectorBlock<SAST>::ProcessVec0L(const RunInfo &runInfo
         }
         GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
         CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
-        if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 16) ||
+        if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > TQ4_MAX_STAGED_ROWS) ||
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
             mte3Size = mte2Size;

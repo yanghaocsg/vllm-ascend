@@ -1789,9 +1789,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> turboquant_sparse_flash_attention
     return {output, softmax_max, softmax_sum};
 }
 
-at::Tensor turbo_quant_compress_latent_meta(const at::Tensor &latent, const at::Tensor &centroids)
+at::Tensor turbo_quant_compress_latent_meta(const at::Tensor &latent, const at::Tensor &centroids, int64_t output_mode)
 {
-    at::Tensor slot = at::empty({latent.size(0), 320}, latent.options().dtype(at::kByte));
+    constexpr int64_t legacySlotBytes = 320;
+    constexpr int64_t compactSlotBytes = 258;
+    TORCH_CHECK(output_mode == 0 || output_mode == 1,
+                "TurboQuant compression output_mode must be 0 or 1, got ", output_mode);
+    int64_t slotBytes = output_mode == 1 ? compactSlotBytes : legacySlotBytes;
+    at::Tensor slot = at::empty({latent.size(0), slotBytes}, latent.options().dtype(at::kByte));
     return slot;
 }
 } // namespace meta

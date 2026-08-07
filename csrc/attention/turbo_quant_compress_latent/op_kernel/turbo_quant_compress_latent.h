@@ -6,26 +6,32 @@
 using namespace AscendC;
 
 // TurboQuant COMPRESS for the MLA KV latent (reverse of tq_dequant_latent).
-// Input  latent_h [N, 512] fp16  (= post-rmsnorm latent already @ signed-Hadamard, NOT normalized)
-// Output slot     [N, 320] int8  ([0:256) 512 nibbles packed, [256:258) vecNorm fp16, [258:320) pad)
+// Input  latent_h [N, 512] fp32 (= post-rmsnorm latent already @ signed-Hadamard, NOT normalized)
+// Output mode 0: [N, 320] uint8 ([0:256) codes, [256:258) raw norm, [258:320) pad).
+// Output mode 1: [N, 258] uint8 ([0:256) codes, [256:258) code-norm-corrected scale).
 // Per token: norm=||z|| ; u=z/norm ; nibble[d] = #{midpoint-boundaries <= u[d]} (nearest of 16
 // sorted centroids) ; int16[i]=nib[4i]|nib[4i+1]<<4|nib[4i+2]<<8|nib[4i+3]<<12 ; store vecNorm.
-// NOTE: HEAD_DIM/SLOT_PAD hardcoded to 512/320 (GLM-5.1 kv_lora_rank=512). De-hardcode is a
-// follow-up optimization (see tq4-csrc-dehardcode memory); port as-is for now.
+// HEAD_DIM=512 is an operator-protocol invariant validated by the Python entry point.
 constexpr uint32_t HEAD_DIM     = 512;
-constexpr uint32_t SLOT_PAD     = 320;
+constexpr uint32_t LEGACY_SLOT_BYTES = 320;
 constexpr uint32_t PACKED_BYTES = 256;   // 512 nibbles / 2
+constexpr uint32_t COMPACT_SLOT_BYTES = PACKED_BYTES + sizeof(half);
 constexpr uint32_t N_CENT       = 16;
 constexpr uint32_t ALIGN_BYTES  = 64;
+constexpr float NORM_SQUARED_EPS = 1e-16f;
+constexpr uint32_t OUTPUT_MODE_LEGACY = 0;
+constexpr uint32_t OUTPUT_MODE_COMPACT_CORRECTED = 1;
 
 class KernelTurboQuantCompressLatent {
 public:
     __aicore__ inline KernelTurboQuantCompressLatent() {}
 
     __aicore__ inline void Init(GM_ADDR latent, GM_ADDR centroids, GM_ADDR slotOut,
-                                uint32_t numTokens, uint32_t tokensPerCore)
+                                uint32_t numTokens, uint32_t tokensPerCore, uint32_t outputMode)
     {
         numTokens_ = numTokens;
+        compactCorrected_ = outputMode == OUTPUT_MODE_COMPACT_CORRECTED;
+        slotBytes_ = compactCorrected_ ? COMPACT_SLOT_BYTES : LEGACY_SLOT_BYTES;
         uint32_t cid = GetBlockIdx();
         tokStart_ = cid * tokensPerCore;
         tokEnd_ = tokStart_ + tokensPerCore;
@@ -36,7 +42,7 @@ public:
         slotGm_.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(slotOut));
 
         uint32_t fp32B = ((HEAD_DIM * sizeof(float)) + ALIGN_BYTES - 1) & ~(ALIGN_BYTES - 1);
-        uint32_t slotB = ((SLOT_PAD) + ALIGN_BYTES - 1) & ~(ALIGN_BYTES - 1);
+        uint32_t slotB = ((LEGACY_SLOT_BYTES) + ALIGN_BYTES - 1) & ~(ALIGN_BYTES - 1);
         uint32_t maskB = ((HEAD_DIM / 8) + ALIGN_BYTES - 1) & ~(ALIGN_BYTES - 1);
 
         pipe_.InitBuffer(inQ_, 1, fp32B);
@@ -98,7 +104,7 @@ private:
         PipeBarrier<PIPE_V>();
         ReduceSum(red, tmp, red, HEAD_DIM);
         PipeBarrier<PIPE_V>();
-        float norm = sqrt(red.GetValue(0) + 1e-16f);
+        float norm = sqrt(red.GetValue(0) + NORM_SQUARED_EPS);
         Duplicate(u, 0.0f, HEAD_DIM);
         PipeBarrier<PIPE_V>();
         Muls(u, in, 1.0f / norm, HEAD_DIM);                 // u = z / norm
@@ -129,11 +135,34 @@ private:
         LocalTensor<int4b_t> i4 = slot.ReinterpretCast<int4b_t>();
         Cast(i4, packHalf, RoundMode::CAST_RINT, HEAD_DIM);                          // half -> int4b_t -> slot[0:256]
         PipeBarrier<PIPE_V>();
-        half hn = (half)norm;
+        float outputScale = norm;
+        if (compactCorrected_) {
+            // The packed nibble is the original centroid index. Gather the selected
+            // centroid values and fold their L2 norm into the stored FP16 scale.
+            Muls(tmp, nib, static_cast<float>(sizeof(float)), HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<int32_t> codeOffsets = sel.ReinterpretCast<int32_t>();
+            LocalTensor<uint32_t> unsignedCodeOffsets = sel.ReinterpretCast<uint32_t>();
+            Cast(codeOffsets, tmp, RoundMode::CAST_ROUND, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            LocalTensor<float> cent = centBuf_.Get<float>();
+            Gather(tmp, cent, unsignedCodeOffsets, 0, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            Mul(tmp, tmp, tmp, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            ReduceSum(red, tmp, red, HEAD_DIM);
+            PipeBarrier<PIPE_V>();
+            outputScale = norm / sqrt(red.GetValue(0) + NORM_SQUARED_EPS);
+        }
+        half hn = (half)outputScale;
         uint16_t nbits = *reinterpret_cast<uint16_t*>(&hn);
         slot.SetValue(PACKED_BYTES, (uint8_t)(nbits & 0xff));
         slot.SetValue(PACKED_BYTES + 1, (uint8_t)((nbits >> 8) & 0xff));
-        for (uint32_t i = PACKED_BYTES + 2; i < SLOT_PAD; ++i) slot.SetValue(i, (uint8_t)0);
+        if (!compactCorrected_) {
+            for (uint32_t i = COMPACT_SLOT_BYTES; i < LEGACY_SLOT_BYTES; ++i) {
+                slot.SetValue(i, (uint8_t)0);
+            }
+        }
 
         inQ_.FreeTensor(in);
         outQ_.EnQue(slot);
@@ -142,7 +171,12 @@ private:
     __aicore__ inline void CopyOut(uint32_t t)
     {
         LocalTensor<uint8_t> slot = outQ_.DeQue<uint8_t>();
-        DataCopy(slotGm_[(uint64_t)t * SLOT_PAD], slot, SLOT_PAD);
+        if (compactCorrected_) {
+            DataCopyParams copyParams{1, static_cast<uint16_t>(COMPACT_SLOT_BYTES), 0, 0};
+            DataCopyPad(slotGm_[(uint64_t)t * slotBytes_], slot, copyParams);
+        } else {
+            DataCopy(slotGm_[(uint64_t)t * slotBytes_], slot, LEGACY_SLOT_BYTES);
+        }
         outQ_.FreeTensor(slot);
     }
 
@@ -155,6 +189,8 @@ private:
     GlobalTensor<float> centGm_;
     GlobalTensor<uint8_t> slotGm_;
     uint32_t numTokens_, tokStart_, tokEnd_;
+    uint32_t slotBytes_ = LEGACY_SLOT_BYTES;
+    bool compactCorrected_ = false;
     float bnd_[N_CENT];
 };
 

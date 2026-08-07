@@ -318,8 +318,10 @@ struct ConstInfo {
 };
 
 constexpr uint32_t TQ4_HEAD_DIM = 512U;
-constexpr uint32_t TQ4_SLOT_BYTES = 320U;
 constexpr uint32_t TQ4_PACKED_BYTES = 256U;
+constexpr uint32_t TQ4_SCALE_BYTES = sizeof(half);
+constexpr uint32_t TQ4_SLOT_BYTES = TQ4_PACKED_BYTES + TQ4_SCALE_BYTES;
+constexpr uint32_t TQ4_SLOT_ROW_BYTES = (TQ4_SLOT_BYTES + 31U) / 32U * 32U;
 constexpr float TQ4_CENTROID_BYTE_STRIDE = 4.0F;
 
 __aicore__ inline void LoadTq4Centroids(LocalTensor<float> centroids)

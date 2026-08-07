@@ -37,9 +37,19 @@ static ge::graphStatus TilingFunc(gert::TilingContext* context)
     uint32_t taskNum = (numTokens + tokensPerCore - 1) / tokensPerCore;
     uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(taskNum, 0, aivNum);
 
+    const gert::RuntimeAttrs* attrs = context->GetAttrs();
+    OPS_ERR_IF(attrs == nullptr,
+        OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "GetAttrs is nullptr."),
+        return ge::GRAPH_FAILED);
+    const int64_t* outputModeAttr = attrs->GetAttrPointer<int64_t>(0);
+    OPS_ERR_IF(outputModeAttr == nullptr || (*outputModeAttr != 0 && *outputModeAttr != 1),
+        OPS_REPORT_VECTOR_INNER_ERR(context->GetNodeName(), "output_mode must be 0 or 1."),
+        return ge::GRAPH_FAILED);
+
     TurboQuantCompressLatentTilingData tilingData;
     tilingData.set_num_tokens(numTokens);
     tilingData.set_tokens_per_core(tokensPerCore);
+    tilingData.set_output_mode(static_cast<uint32_t>(*outputModeAttr));
 
     context->SetBlockDim(blockDim);
     tilingData.SaveToBuffer(context->GetRawTilingData()->GetData(),

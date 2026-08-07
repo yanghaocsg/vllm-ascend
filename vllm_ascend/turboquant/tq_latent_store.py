@@ -1,10 +1,10 @@
 """TurboQuant Hadamard-512 latent compress for REAL 4-bit MLA-latent storage.
 
 Scheme: signed Hadamard-512, single L2 norm per slot, 16-level Lloyd-Max codebook
-scaled to N(0,1/512). Slot = 320 B uint8 = 256 nibble bytes (512x4bit) + 2 B vecNorm
-fp16 + 62 B pad.
+scaled to N(0,1/512). The legacy slot is 320 B; DSV4 uses a compact 258 B slot containing
+256 nibble bytes (512x4bit) and a 2 B code-norm-corrected FP16 scale.
 
-compress/compress_kernel(latent[N,512]) -> uint8[N,320] (latent already rmsnorm'd).
+compress_kernel defaults to the legacy layout; compact output must be selected explicitly.
 Read side (dequant-in-SFA) is the csrc turbo_quant_sparse_flash_attention op.
 """
 import math
@@ -39,6 +39,8 @@ SCALE_BYTES = 2
 SLOT_ALIGN = 64
 ROPE_DTYPE_BYTES = 2
 NORM_SQUARED_EPS = 1e-16
+COMPRESS_OUTPUT_LEGACY = 0
+COMPRESS_OUTPUT_COMPACT_CORRECTED = 1
 
 
 def _is_power_of_2(n):
@@ -61,6 +63,10 @@ def packed_bytes(head_dim=HEAD_DIM):
 
 def base_slot_size(head_dim=HEAD_DIM):
     return _align_up(packed_bytes(head_dim) + SCALE_BYTES, SLOT_ALIGN)
+
+
+def compact_slot_size(head_dim=HEAD_DIM):
+    return packed_bytes(head_dim) + SCALE_BYTES
 
 
 def fused_slot_size(head_dim=HEAD_DIM, rope_head_dim=ROPE_HEAD_DIM):
@@ -145,10 +151,12 @@ def compress(latent, head_dim=None):
 
 
 @torch.no_grad()
-def compress_kernel(latent, head_dim=None):
-    """Fused compress via torch op turbo_quant_compress_latent. latent [N,head_dim] (rmsnorm'd, fp16/bf16) ->
-    (slot uint8 [N,base_slot_size(head_dim)], z). Hadamard (1 matmul) in torch; norm/quantize/pack in the
-    csrc kernel (aclnnTurboQuantCompressLatent). Replaces the ~18-op torch compress with: 1 matmul + 1 op call."""
+def compress_kernel(latent, head_dim=None, output_mode=COMPRESS_OUTPUT_LEGACY):
+    """Fused compress via turbo_quant_compress_latent.
+
+    Returns a legacy aligned slot by default, or a compact corrected slot when requested explicitly.
+    Hadamard remains a torch matmul; norm, quantization, packing, and optional correction are fused in C++.
+    """
     _require_npu()
     head_dim = int(latent.shape[-1] if head_dim is None else head_dim)
     _check_head_dim(head_dim)
@@ -156,7 +164,11 @@ def compress_kernel(latent, head_dim=None):
     dev = latent.device
     z = (latent.float() @ _PIT.to(dev)).contiguous()        # Hadamard (un-normalized), fp32
     cent = _CENT.to(dev).contiguous()
-    slot = torch.ops._C_ascend.turbo_quant_compress_latent(z, cent)  # [N,320] uint8, fused norm+quantize+pack
+    if output_mode not in {COMPRESS_OUTPUT_LEGACY, COMPRESS_OUTPUT_COMPACT_CORRECTED}:
+        raise ValueError(f"Unsupported TurboQuant compression output mode: {output_mode}")
+    slot = torch.ops._C_ascend.turbo_quant_compress_latent(
+        z, cent, output_mode
+    )  # Legacy [N,320] raw scale or compact [N,258] corrected scale.
     return slot, (z,)   # hold z alive until caller scatters (matches prior tuple shape)
 
 

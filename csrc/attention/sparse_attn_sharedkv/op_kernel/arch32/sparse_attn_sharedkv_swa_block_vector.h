@@ -228,7 +228,10 @@ __aicore__ inline void SWAVectorBlock<SAST>::DequantTqCache(
     LocalTensor<float> centroids = tqCentBuff.Get<float>();
 
     for (uint64_t slotIdx = vectorCoreIdx; slotIdx < slotCount; slotIdx += vectorCoreCount) {
-        DataCopy(slot, source[slotIdx * TQ4_SLOT_BYTES], TQ4_SLOT_BYTES);
+        DataCopyExtParams copyParams{1, TQ4_SLOT_BYTES, 0, 0};
+        DataCopyPadExtParams<uint8_t> padParams{
+            true, 0, static_cast<uint8_t>(TQ4_SLOT_ROW_BYTES - TQ4_SLOT_BYTES), 0};
+        DataCopyPad(slot, source[slotIdx * TQ4_SLOT_BYTES], copyParams, padParams);
         SetFlag<HardEvent::MTE2_V>(0);
         WaitFlag<HardEvent::MTE2_V>(0);
         DequantTq4Slot(slot, output, work, signedCodes, indices, centroids);

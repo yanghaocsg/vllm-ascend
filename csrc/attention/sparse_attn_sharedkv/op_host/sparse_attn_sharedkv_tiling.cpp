@@ -1375,7 +1375,7 @@ ge::graphStatus SASTilingCheck::CheckFeatureShape() const
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.perfMode != SASTemplateMode::SWA_TEMPLATE_MODE &&
                     sasInfo_.cmpKvStride % TQ4_SLOT_SIZE != 0,
-                OP_LOGE(opName_, "cmp_kv stride must be divisible by the 320-byte TQ slot size."),
+                OP_LOGE(opName_, "cmp_kv stride must be divisible by the 258-byte TQ slot size."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.perfMode != SASTemplateMode::SWA_TEMPLATE_MODE &&
                     cmpKvType_ != ge::DT_UINT8,

@@ -2434,7 +2434,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                 -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("turboquant_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::turboquant_sparse_flash_attention);
-    ops.def("turbo_quant_compress_latent(Tensor latent, Tensor centroids) -> Tensor");
+    ops.def("turbo_quant_compress_latent(Tensor latent, Tensor centroids, int output_mode=0) -> Tensor");
     ops.impl("turbo_quant_compress_latent", torch::kPrivateUse1, &vllm_ascend::turbo_quant_compress_latent);
 
     ops.def(
