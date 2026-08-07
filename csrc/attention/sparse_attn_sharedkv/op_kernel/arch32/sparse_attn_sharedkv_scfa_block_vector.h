@@ -669,7 +669,7 @@ __aicore__ inline void SASVectorBlock<SAST>::CopyInSingleKv(int64_t &mte2Size, i
         LocalTensor<uint8_t> slot = tmpBuff1.Get<uint8_t>()[
             TQ4_RAW_OFFSET + mergeMte3Idx % 2 * TQ4_RAW_REGION_BYTES +
             stagedRow * TQ4_SLOT_ROW_BYTES];
-        DataCopyExtParams copyParams{1, TQ4_SLOT_BYTES, 0, 0};
+        DataCopyExtParams copyParams{1, TQ4_SLOT_BYTES, 0, 0, 0};
         DataCopyPadExtParams<uint8_t> padParams{
             true, 0, static_cast<uint8_t>(TQ4_SLOT_ROW_BYTES - TQ4_SLOT_BYTES), 0};
         DataCopyPad(slot, cmpTqGm_[keyBNBOffset], copyParams, padParams);
