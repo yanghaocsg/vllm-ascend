@@ -18,6 +18,7 @@ constexpr uint32_t PACKED_BYTES = 256;   // 512 nibbles / 2
 constexpr uint32_t COMPACT_SLOT_BYTES = PACKED_BYTES + sizeof(half);
 constexpr uint32_t N_CENT       = 16;
 constexpr uint32_t ALIGN_BYTES  = 64;
+constexpr float CENTROID_BYTE_STRIDE = 4.0F;
 constexpr float NORM_SQUARED_EPS = 1e-16f;
 constexpr uint32_t OUTPUT_MODE_LEGACY = 0;
 constexpr uint32_t OUTPUT_MODE_COMPACT_CORRECTED = 1;
@@ -139,7 +140,7 @@ private:
         if (compactCorrected_) {
             // The packed nibble is the original centroid index. Gather the selected
             // centroid values and fold their L2 norm into the stored FP16 scale.
-            Muls(tmp, nib, static_cast<float>(sizeof(float)), HEAD_DIM);
+            Muls(tmp, nib, CENTROID_BYTE_STRIDE, HEAD_DIM);
             PipeBarrier<PIPE_V>();
             LocalTensor<int32_t> codeOffsets = sel.ReinterpretCast<int32_t>();
             LocalTensor<uint32_t> unsignedCodeOffsets = sel.ReinterpretCast<uint32_t>();
