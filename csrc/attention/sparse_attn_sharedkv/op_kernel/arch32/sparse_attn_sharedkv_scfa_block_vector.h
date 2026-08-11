@@ -160,6 +160,14 @@ private:
     static constexpr uint32_t TQ4_SIGNED_OFFSET = TQ4_WORK_BYTES;
     static constexpr uint32_t TQ4_INDEX_OFFSET = TQ4_SIGNED_OFFSET + TQ4_SIGNED_BYTES;
     static constexpr uint32_t TQ4_RAW_OFFSET = TQ4_INDEX_OFFSET + TQ4_INDEX_BYTES;
+    static constexpr uint32_t TQ4_CENTROID_COUNT = 16U;
+    static constexpr uint32_t TQ4_SCALE_GATHER_INDEX_OFFSET = TQ4_CENTROID_COUNT * sizeof(float);
+    static constexpr uint32_t TQ4_SCALE_GATHER_INDEX_BYTES = TQ4_DEQUANT_BATCH_ROWS * sizeof(uint32_t);
+    static constexpr uint32_t TQ4_SCALE_CARRIER_BYTES = TQ4_DEQUANT_BATCH_ROWS * BYTE_BLOCK;
+    static constexpr uint32_t TQ4_SCALE_BROADCAST_OFFSET = BYTE_BLOCK;
+    static constexpr uint32_t TQ4_SCALE_BROADCAST_BYTES =
+        (TQ4_DEQUANT_BATCH_ROWS + FP32_BLOCK_ELEMENT_NUM - 1U) / FP32_BLOCK_ELEMENT_NUM *
+        FP32_BLOCK_ELEMENT_NUM * FP32_BLOCK_ELEMENT_NUM * sizeof(float);
     // Vec0 and Vec2 execute in different pipeline stages, but keep Vec2's existing 512B scratch region reserved.
     static constexpr uint32_t V0_VEC2_TEMP_OFFSET = 384U * sizeof(T);
     static constexpr uint32_t V0_VEC2_TEMP_BYTES = ConstInfo::BUFFER_SIZE_BYTE_512B;
@@ -172,6 +180,13 @@ private:
     static_assert(TQ4_DEQUANT_BATCH_ROWS > 0U, "TQ4 dequant scratch cannot hold one row");
     static_assert(TQ4_RAW_OFFSET + TQ4_RAW_BUFFER_BYTES <= ConstInfo::BUFFER_SIZE_BYTE_32K,
                   "TQ4 batched dequant scratch exceeds tmpBuff1");
+    static_assert(TQ4_SCALE_GATHER_INDEX_OFFSET + TQ4_SCALE_GATHER_INDEX_BYTES <=
+                      ConstInfo::BUFFER_SIZE_BYTE_256B,
+                  "TQ4 scale gather indices overlap tqCentBuff");
+    static_assert(TQ4_SCALE_CARRIER_BYTES + TQ4_DEQUANT_BATCH_ROWS * sizeof(half) <= TQ4_SIGNED_BYTES,
+                  "TQ4 scale extraction exceeds signed-code scratch");
+    static_assert(TQ4_SCALE_BROADCAST_OFFSET + TQ4_SCALE_BROADCAST_BYTES <= TQ4_INDEX_BYTES,
+                  "TQ4 scale broadcast exceeds index scratch");
     static_assert(TQ4_TOPK_CACHE_BYTES <= TQ4_BLOCK_TABLE_CACHE_OFFSET,
                   "TQ4 index caches overlap in v0ValidSizeBuff");
     static constexpr T SOFTMAX_MIN_NUM = -2e38;
@@ -255,6 +270,12 @@ __aicore__ inline void SASVectorBlock<SAST>::InitBuffers(TPipe *pipe)
     if (constInfo.kvQuantMode == 3) {
         pipe->InitBuffer(tqCentBuff, ConstInfo::BUFFER_SIZE_BYTE_256B);
         LoadTq4Centroids(tqCentBuff.Get<float>());
+        LocalTensor<uint32_t> scaleGatherIndices =
+            tqCentBuff.Get<uint32_t>()[TQ4_SCALE_GATHER_INDEX_OFFSET / sizeof(uint32_t)];
+        for (uint32_t row = 0; row < TQ4_DEQUANT_BATCH_ROWS; ++row) {
+            scaleGatherIndices.SetValue(row, row * BYTE_BLOCK);
+        }
+        PipeBarrier<PIPE_ALL>();
     }
 
     // M_MAX = 512/2vector = 256, 256 * sizeof(T) * N_Buffer
@@ -631,7 +652,13 @@ __aicore__ inline void SASVectorBlock<SAST>::DequantTq4Rows(LocalTensor<uint8_t>
     LocalTensor<uint32_t> unsignedIndices = indices.template ReinterpretCast<uint32_t>();
     LocalTensor<float> centroids = tqCentBuff.Get<float>();
     LocalTensor<int4b_t> packedCodes = slots.template ReinterpretCast<int4b_t>();
-    LocalTensor<uint16_t> slotU16 = slots.template ReinterpretCast<uint16_t>();
+    LocalTensor<half> slotHalf = slots.template ReinterpretCast<half>();
+    LocalTensor<half> scaleCarriers = signedCodes;
+    LocalTensor<half> scalesFp16 = signedCodes[TQ4_SCALE_CARRIER_BYTES / sizeof(half)];
+    LocalTensor<float> scalesFp32 = indices.template ReinterpretCast<float>();
+    LocalTensor<float> scalesBrcb = scalesFp32[TQ4_SCALE_BROADCAST_OFFSET / sizeof(float)];
+    LocalTensor<uint32_t> scaleGatherIndices =
+        tqCentBuff.Get<uint32_t>()[TQ4_SCALE_GATHER_INDEX_OFFSET / sizeof(uint32_t)];
 
     for (int64_t base = 0; base < rowCount; base += TQ4_DEQUANT_BATCH_ROWS) {
         uint32_t currentRows = static_cast<uint32_t>(
@@ -652,23 +679,36 @@ __aicore__ inline void SASVectorBlock<SAST>::DequantTq4Rows(LocalTensor<uint8_t>
         Gather(work, centroids, unsignedIndices, 0, elementCount);
         PipeBarrier<PIPE_V>();
 
-        // CopyOutMrgeResult waits for MTE2 before this function, so the scalar scale reads are visible here.
-        // Each Muls touches a disjoint row; drain PIPE_V once after issuing the current batch.
-        for (uint32_t row = 0; row < currentRows; ++row) {
-            uint32_t sourceRow = static_cast<uint32_t>(base) + row;
-            uint32_t scaleIndex =
-                (sourceRow * TQ4_SLOT_ROW_BYTES + TQ4_PACKED_BYTES) / sizeof(uint16_t);
-            uint16_t scaleBits = slotU16.GetValue(scaleIndex);
-            half scale = *reinterpret_cast<half *>(&scaleBits);
-            Muls(work[row * TQ4_HEAD_DIM], work[row * TQ4_HEAD_DIM], static_cast<float>(scale), TQ4_HEAD_DIM);
-        }
+        // Extract one aligned 32-byte carrier per staged row, then gather the first FP16 value.
+        // This follows the TQ SFA bulk-scale pattern and avoids scalar UB reads and per-row barriers.
+        DataCopyParams scaleCopyParams;
+        scaleCopyParams.blockCount = static_cast<uint16_t>(currentRows);
+        scaleCopyParams.blockLen = 1;
+        scaleCopyParams.srcStride = static_cast<uint16_t>(TQ4_SLOT_ROW_BYTES / BYTE_BLOCK - 1U);
+        scaleCopyParams.dstStride = 0;
+        uint32_t scaleSourceOffset =
+            (static_cast<uint32_t>(base) * TQ4_SLOT_ROW_BYTES + TQ4_PACKED_BYTES) / sizeof(half);
+        DataCopy(scaleCarriers, slotHalf[scaleSourceOffset], scaleCopyParams);
+        PipeBarrier<PIPE_V>();
+        Gather(scalesFp16, scaleCarriers, scaleGatherIndices, 0, currentRows);
+        PipeBarrier<PIPE_V>();
+        Cast(scalesFp32, scalesFp16, RoundMode::CAST_NONE, currentRows);
+        PipeBarrier<PIPE_V>();
+        uint8_t scaleBrcbRepeats = static_cast<uint8_t>(
+            (currentRows + FP32_BLOCK_ELEMENT_NUM - 1U) / FP32_BLOCK_ELEMENT_NUM);
+        Brcb(scalesBrcb, scalesFp32, scaleBrcbRepeats, {1, FP32_BLOCK_ELEMENT_NUM});
+        PipeBarrier<PIPE_V>();
+        RowMuls(work, work, scalesBrcb, currentRows, TQ4_HEAD_DIM, TQ4_HEAD_DIM);
         PipeBarrier<PIPE_V>();
         if constexpr (IsSameType<KV_T, bfloat16_t>::value) {
             Cast(output[base * TQ4_HEAD_DIM], work, RoundMode::CAST_RINT, elementCount);
         } else {
             Cast(output[base * TQ4_HEAD_DIM], work, RoundMode::CAST_ROUND, elementCount);
         }
-        PipeBarrier<PIPE_V>();
+        // The next batch reuses work; the final batch is synchronized by CopyOutMrgeResult's V_MTE3 event.
+        if (base + static_cast<int64_t>(currentRows) < rowCount) {
+            PipeBarrier<PIPE_V>();
+        }
     }
 }
 
@@ -730,30 +770,28 @@ __aicore__ inline void SASVectorBlock<SAST>::CopyInKv(int64_t &mte2Size, int64_t
         return;
     }
     if (constInfo.kvQuantMode == 3) {
-        // DataCopyPad can combine only two complete slots. Tail, duplicate-offset, and stride-limit cases
-        // retain the original single-slot copies.
         int64_t validHitCount = (keyOffset1 >= 0) + (keyOffset2 >= 0);
-        int64_t keyDistance = keyOffset1 > keyOffset2 ? keyOffset1 - keyOffset2 : keyOffset2 - keyOffset1;
-        int64_t keySrcStride = keyDistance - static_cast<int64_t>(TQ4_SLOT_BYTES);
-        if (unlikely(validHitCount != 2 || keySrcStride < 0 || keySrcStride >= INT32_MAX)) {
+        int64_t keySrcStride = keyOffset2 - keyOffset1 - static_cast<int64_t>(TQ4_SLOT_BYTES);
+        // A two-burst copy is valid only when increasing GM order matches logical sparse-index order.
+        // Descending, duplicate, tail, and stride-limit cases retain the ordered single-slot path.
+        if (validHitCount == 2 && keySrcStride >= 0 && keySrcStride < INT32_MAX) {
+            int64_t stagedRow = mte2Size - mte3Size;
+            if (stagedRow == 0) {
+                SetFlag<HardEvent::V_MTE2>(0);
+                WaitFlag<HardEvent::V_MTE2>(0);
+            }
+            LocalTensor<uint8_t> slot = tmpBuff1.Get<uint8_t>()[
+                TQ4_RAW_OFFSET + mergeMte3Idx % 2 * TQ4_RAW_REGION_BYTES + stagedRow * TQ4_SLOT_ROW_BYTES];
+            DataCopyExtParams copyParams{static_cast<uint16_t>(validHitCount), TQ4_SLOT_BYTES,
+                                         static_cast<uint32_t>(keySrcStride), 0, 0};
+            DataCopyPadExtParams<uint8_t> padParams{
+                true, 0, static_cast<uint8_t>(TQ4_SLOT_ROW_BYTES - TQ4_SLOT_BYTES), 0};
+            DataCopyPad(slot, cmpTqGm_[keyOffset1], copyParams, padParams);
+            mte2Size += validHitCount;
+        } else {
             CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
             CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
-            return;
         }
-        int64_t stagedRow = mte2Size - mte3Size;
-        if (stagedRow == 0) {
-            SetFlag<HardEvent::V_MTE2>(0);
-            WaitFlag<HardEvent::V_MTE2>(0);
-        }
-        LocalTensor<uint8_t> slot = tmpBuff1.Get<uint8_t>()[
-            TQ4_RAW_OFFSET + mergeMte3Idx % 2 * TQ4_RAW_REGION_BYTES + stagedRow * TQ4_SLOT_ROW_BYTES];
-        DataCopyExtParams copyParams{static_cast<uint16_t>(validHitCount), TQ4_SLOT_BYTES,
-                                     static_cast<uint32_t>(keySrcStride), 0, 0};
-        DataCopyPadExtParams<uint8_t> padParams{
-            true, 0, static_cast<uint8_t>(TQ4_SLOT_ROW_BYTES - TQ4_SLOT_BYTES), 0};
-        int64_t startGmOffset = keyOffset1 < keyOffset2 ? keyOffset1 : keyOffset2;
-        DataCopyPad(slot, cmpTqGm_[startGmOffset], copyParams, padParams);
-        mte2Size += validHitCount;
         return;
     }
 

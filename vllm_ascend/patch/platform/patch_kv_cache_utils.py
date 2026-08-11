@@ -5,6 +5,7 @@ from collections import defaultdict
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
@@ -20,6 +21,8 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.core.kv_cache_interface import AscendPackedKVCacheTensor
 from vllm_ascend.utils import vllm_version_is
+
+logger = init_logger(__name__)
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 _orig_get_max_concurrency_for_kv_cache_config = (
@@ -282,6 +285,15 @@ def _get_kv_cache_config_deepseek_v4(
     assert bytes_per_block > 0
     num_blocks = available_memory // bytes_per_block
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    logger.info_once(
+        "DeepSeek V4 KV cache layout: mode=standard, available_memory=%d "
+        "bytes, bytes_per_block=%d, num_blocks=%d, physical_tensors=%d",
+        available_memory,
+        bytes_per_block,
+        num_blocks,
+        sum(len(slots) for slots in buckets.values()) + len(mtp_layers),
+        scope="local",
+    )
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for page_size, slots in buckets.items():
@@ -397,6 +409,17 @@ def _get_tq4_kv_cache_config(
     num_blocks = may_override_num_blocks(
         vllm_config, available_memory // bytes_per_block
     )
+    logger.info_once(
+        "DeepSeek V4 KV cache layout: mode=tq4, available_memory=%d bytes, "
+        "bytes_per_block=%d, num_blocks=%d, physical_page_sizes=%s, "
+        "dedicated_mtp_bytes=%d",
+        available_memory,
+        bytes_per_block,
+        num_blocks,
+        tuple(physical_page_sizes),
+        sum(page_size for _, page_size in mtp_layers),
+        scope="local",
+    )
 
     kv_cache_tensors: list[KVCacheTensor] = []
     for slot_idx, physical_page_size in enumerate(physical_page_sizes):
@@ -433,11 +456,20 @@ def _get_max_concurrency_for_kv_cache_config(
         return _orig_get_max_concurrency_for_kv_cache_config(
             vllm_config, kv_cache_config
         )
-    blocks_per_request = sum(
+    group_blocks_per_request = [
         group.kv_cache_spec.max_memory_usage_pages(vllm_config)
         for group in kv_cache_config.kv_cache_groups
-    )
+    ]
+    blocks_per_request = sum(group_blocks_per_request)
     assert blocks_per_request > 0
+    logger.info_once(
+        "DeepSeek V4 KV cache request budget: group_blocks=%s, "
+        "blocks_per_request=%d, num_blocks=%d",
+        tuple(group_blocks_per_request),
+        blocks_per_request,
+        kv_cache_config.num_blocks,
+        scope="local",
+    )
     return kv_cache_config.num_blocks / blocks_per_request
 
 

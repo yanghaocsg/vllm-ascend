@@ -1,3 +1,4 @@
+import inspect
 import math
 
 import torch
@@ -38,16 +39,14 @@ def test_shared_kv_hadamard_attention_is_basis_invariant():
     torch.testing.assert_close(restored_output, reference, rtol=1e-10, atol=1e-10)
 
 
-def test_turboquant_slot_layout_is_320_bytes():
+def test_turboquant_legacy_and_compact_slot_layouts():
     head_dim = 512
-    packed_bytes = head_dim // 2
-    scale_bytes = 2
-    slot_alignment = 64
-    slot_size = (packed_bytes + scale_bytes + slot_alignment - 1) // slot_alignment * slot_alignment
-
-    assert packed_bytes == 256
-    assert slot_size == 320
-    assert (1024 - slot_size) / 1024 == 0.6875
+    assert tq_latent_store.packed_bytes(head_dim) == 256
+    assert tq_latent_store.base_slot_size(head_dim) == 320
+    assert tq_latent_store.compact_slot_size(head_dim) == 258
+    output_mode = inspect.signature(tq_latent_store.compress_kernel).parameters["output_mode"]
+    assert output_mode.default == tq_latent_store.COMPRESS_OUTPUT_LEGACY
+    assert (1024 - tq_latent_store.compact_slot_size(head_dim)) / 1024 == 0.748046875
 
 
 def test_turboquant_code_norm_correction_preserves_slot_layout(monkeypatch):
@@ -79,3 +78,13 @@ def test_turboquant_code_norm_correction_preserves_slot_layout(monkeypatch):
     torch.testing.assert_close(corrected[:, :packed_bytes], codes, rtol=0, atol=0)
     assert torch.equal(corrected[:, packed_bytes + 2 :], slot[:, packed_bytes + 2 :])
     assert corrected.shape == slot.shape
+
+    compact = corrected[:, :tq_latent_store.compact_slot_size(head_dim)]
+    assert compact.shape == (2, packed_bytes + 2)
+    torch.testing.assert_close(compact[:, :packed_bytes], codes, rtol=0, atol=0)
+    torch.testing.assert_close(
+        compact[:, packed_bytes:].contiguous().view(torch.float16).view(-1),
+        expected_scale,
+        rtol=0,
+        atol=0,
+    )

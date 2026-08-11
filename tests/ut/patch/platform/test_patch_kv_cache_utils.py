@@ -138,8 +138,8 @@ def test_tq4_allocator_packs_logical_pages_into_physical_pages() -> None:
         layer_names=["c4.0", "c4.1", "index.0", "index.1"],
         kv_cache_spec=_uniform_spec(
             {
-                "c4.0": _mla_spec(320, cache_dtype_str="turboquant_4bit_nc"),
-                "c4.1": _mla_spec(320, cache_dtype_str="turboquant_4bit_nc"),
+                "c4.0": _mla_spec(258, cache_dtype_str="turboquant_4bit_nc"),
+                "c4.1": _mla_spec(258, cache_dtype_str="turboquant_4bit_nc"),
                 "index.0": _mla_spec(128, scale_dim=1),
                 "index.1": _mla_spec(128, scale_dim=1),
             }
@@ -169,14 +169,14 @@ def test_tq4_allocator_packs_logical_pages_into_physical_pages() -> None:
         for group in groups
         for spec in group.kv_cache_spec.kv_cache_specs.values()
     ]
-    tq4_page_alignment = _get_page_stride_alignment(
-        tq4_group.kv_cache_spec.kv_cache_specs["c4.0"]
+    physical_page_alignment = math.lcm(
+        *(_get_page_stride_alignment(spec) for spec in main_specs)
     )
     largest_page_size = max(spec.page_size_bytes for spec in main_specs)
     tq4_physical_page_size = (
-        (largest_page_size + tq4_page_alignment - 1)
-        // tq4_page_alignment
-        * tq4_page_alignment
+        (largest_page_size + physical_page_alignment - 1)
+        // physical_page_alignment
+        * physical_page_alignment
     )
     packed_bytes_per_block = tq4_physical_page_size + largest_page_size
     exact_bucket_bytes_per_block = sum(
@@ -248,7 +248,7 @@ def test_deepseek_v4_concurrency_uses_runtime_group_block_budget() -> None:
         KVCacheGroupSpec(
             layer_names=["c4"],
             kv_cache_spec=_uniform_spec(
-                {"c4": _mla_spec(320, cache_dtype_str="turboquant_4bit_nc")}
+                {"c4": _mla_spec(258, cache_dtype_str="turboquant_4bit_nc")}
             ),
         ),
         KVCacheGroupSpec(
@@ -280,3 +280,160 @@ def test_deepseek_v4_concurrency_uses_runtime_group_block_budget() -> None:
     assert _get_max_concurrency_for_kv_cache_config(
         vllm_config, kv_cache_config
     ) == 10
+
+
+def _dsv4_capacity_groups(tq4: bool) -> list[KVCacheGroupSpec]:
+    num_c4_layers = 21
+    num_c128_layers = 20
+
+    c4_specs = {
+        f"c4.attn.{i}": _mla_spec(
+            258 if tq4 else 512,
+            dtype=torch.uint8 if tq4 else torch.bfloat16,
+            cache_dtype_str="turboquant_4bit_nc" if tq4 else None,
+        )
+        for i in range(num_c4_layers)
+    }
+    c4_specs.update(
+        {
+            f"c4.index.{i}": _mla_spec(128, scale_dim=1)
+            for i in range(num_c4_layers)
+        }
+    )
+    c4_group = KVCacheGroupSpec(
+        layer_names=list(c4_specs),
+        kv_cache_spec=_uniform_spec(c4_specs),
+    )
+
+    c128_specs = {
+        f"c128.attn.{i}": _mla_spec(
+            512,
+            compress_ratio=128,
+            dtype=torch.bfloat16,
+        )
+        for i in range(num_c128_layers)
+    }
+    c128_group = KVCacheGroupSpec(
+        layer_names=list(c128_specs),
+        kv_cache_spec=_uniform_spec(c128_specs),
+    )
+
+    swa_specs_0 = {
+        f"swa.{i}": _swa_spec(128, 512, torch.bfloat16)
+        for i in range(22)
+    }
+    swa_specs_1 = {
+        f"swa.{i}": _swa_spec(128, 512, torch.bfloat16)
+        for i in range(22, 43)
+    }
+    swa_specs_1["model.mtp.swa"] = _swa_spec(128, 512, torch.bfloat16)
+    swa_groups = [
+        KVCacheGroupSpec(
+            layer_names=list(specs),
+            kv_cache_spec=_uniform_spec(specs),
+        )
+        for specs in (swa_specs_0, swa_specs_1)
+    ]
+
+    c4_state_specs = {}
+    for i in range(num_c4_layers):
+        c4_state_specs[f"c4.state.{i}"] = AscendSlidingWindowMLASpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=2048,
+            dtype=torch.float32,
+            sliding_window=8,
+            page_size_padded=131_072,
+        )
+        c4_state_specs[f"c4.index_state.{i}"] = AscendSlidingWindowMLASpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=512,
+            dtype=torch.float32,
+            sliding_window=8,
+            page_size_padded=16_640,
+        )
+    c4_state_group = KVCacheGroupSpec(
+        layer_names=list(c4_state_specs),
+        kv_cache_spec=_uniform_spec(c4_state_specs),
+    )
+
+    c128_state_specs = {
+        f"c128.state.{i}": AscendSlidingWindowMLASpec(
+            block_size=32,
+            num_kv_heads=1,
+            head_size=1024,
+            dtype=torch.float32,
+            sliding_window=128,
+            page_size_padded=131_072,
+        )
+        for i in range(num_c128_layers)
+    }
+    c128_state_group = KVCacheGroupSpec(
+        layer_names=list(c128_state_specs),
+        kv_cache_spec=_uniform_spec(c128_state_specs),
+    )
+
+    return [
+        c4_group,
+        c128_group,
+        *swa_groups,
+        c4_state_group,
+        c128_state_group,
+    ]
+
+
+def test_dsv4_tq4_layout_increases_physical_capacity() -> None:
+    baseline_groups = _dsv4_capacity_groups(tq4=False)
+    tq4_groups = _dsv4_capacity_groups(tq4=True)
+    baseline_bytes_per_block = 3_364_096
+    tq4_bytes_per_block = 3_019_228
+    available_memory = baseline_bytes_per_block * 100
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(num_gpu_blocks_override=None),
+        model_config=SimpleNamespace(max_model_len=1_048_576),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+    )
+
+    baseline_num_blocks, baseline_tensors = _get_kv_cache_config_deepseek_v4(
+        vllm_config, baseline_groups, available_memory
+    )
+    tq4_num_blocks, tq4_tensors = _get_kv_cache_config_deepseek_v4(
+        vllm_config, tq4_groups, available_memory
+    )
+
+    assert baseline_num_blocks == 100
+    assert tq4_num_blocks == 111
+    assert sum(tensor.size for tensor in baseline_tensors) == (
+        baseline_bytes_per_block * baseline_num_blocks
+    )
+    assert sum(tensor.size for tensor in tq4_tensors) == (
+        tq4_bytes_per_block * tq4_num_blocks
+    )
+    expected_group_blocks = [2048, 64, 66, 66, 1026, 261]
+    assert [
+        group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+        for group in baseline_groups
+    ] == expected_group_blocks
+    assert [
+        group.kv_cache_spec.max_memory_usage_pages(vllm_config)
+        for group in tq4_groups
+    ] == expected_group_blocks
+
+    baseline_config = KVCacheConfig(
+        num_blocks=baseline_num_blocks,
+        kv_cache_tensors=baseline_tensors,
+        kv_cache_groups=baseline_groups,
+    )
+    tq4_config = KVCacheConfig(
+        num_blocks=tq4_num_blocks,
+        kv_cache_tensors=tq4_tensors,
+        kv_cache_groups=tq4_groups,
+    )
+    assert _get_max_concurrency_for_kv_cache_config(
+        vllm_config, tq4_config
+    ) > _get_max_concurrency_for_kv_cache_config(vllm_config, baseline_config)
