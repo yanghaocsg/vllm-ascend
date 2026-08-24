@@ -123,7 +123,7 @@ static std::string SASDataTypeToSerialString(ge::DataType type)
     if (it != DATATYPE_TO_STRING_MAP.end()) {
         return it->second;
     } else {
-        OP_LOGE("sparseAttnSharedkv", "datatype %d not support", type);
+        OP_LOGE("sparseAttnSharedkv", "datatype %d not support", static_cast<int32_t>(type));
         return "UNDEFINED";
     }
 }
@@ -420,7 +420,6 @@ void TQSASInfoParser::SetSASShape()
     {
         if (opParamInfo_.cmpSparseIndices.tensor != nullptr) {
             cmpSparseIndicesShape_ = opParamInfo_.cmpSparseIndices.tensor->GetStorageShape();
-            uint32_t cmpSparseIndicesT = GetAxisNum(cmpSparseIndicesShape_, SASAxis::T, cmpSparseIndicesLayout_);
         } else {
             OP_LOGE(opName_, "cmp_sparse_indices tensor is nullptr, please check input parameters.");
         }
@@ -557,7 +556,8 @@ ge::graphStatus TQSASInfoParser::GetMaxBlockNumPerBatch()
     }
     if (opParamInfo_.oriBlockTable.tensor->GetStorageShape().GetDim(1) < 0) {
         OP_LOGE(opName_, "%s's second dimension(%lld) should be non-negative number.",
-            ORI_BLOCK_TABLE_NAME.c_str(), opParamInfo_.oriBlockTable.tensor->GetStorageShape().GetDim(1));
+            ORI_BLOCK_TABLE_NAME.c_str(),
+            static_cast<long long>(opParamInfo_.oriBlockTable.tensor->GetStorageShape().GetDim(1)));
         return ge::GRAPH_FAILED;
     }
     oriMaxBlockNumPerBatch_ = opParamInfo_.oriBlockTable.tensor->GetStorageShape().GetDim(1);
@@ -570,20 +570,21 @@ ge::graphStatus TQSASInfoParser::GetMaxBlockNumPerBatch()
         }
         if (qLayout_ == SASLayout::TND) {
             if (opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(0) != bSize_ - 1) {
-                OP_LOGE(opName_, "cmp_block_table's first dimension(%u) should be equal to query's B(%u).",
-                    opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1), bSize_ - 1);
+                OP_LOGE(opName_, "cmp_block_table's first dimension(%lld) should be equal to query's B(%u).",
+                    static_cast<long long>(opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1)), bSize_ - 1);
                 return ge::GRAPH_FAILED;
             }
         } else if (qLayout_ == SASLayout::BSND) {
             if (opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(0) != bSize_) {
-                OP_LOGE(opName_, "cmp_block_table's first dimension(%u) should be equal to query's B(%u).",
-                    opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1), bSize_);
+                OP_LOGE(opName_, "cmp_block_table's first dimension(%lld) should be equal to query's B(%u).",
+                    static_cast<long long>(opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1)), bSize_);
                 return ge::GRAPH_FAILED;
             }
         }
         if (opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1) <= 0) {
             OP_LOGE(opName_, "%s's second dimension(%lld) should be greater than 0",
-                CMP_BLOCK_TABLE_NAME.c_str(), opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1));
+                CMP_BLOCK_TABLE_NAME.c_str(),
+                static_cast<long long>(opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1)));
             return ge::GRAPH_FAILED;
         }
         cmpMaxBlockNumPerBatch_ = opParamInfo_.cmpBlockTable.tensor->GetStorageShape().GetDim(1);
@@ -1084,7 +1085,8 @@ ge::graphStatus TQSASTilingCheck::CheckSingleParaCmpSparseIndices() const
             opParamInfo_.cmpSparseIndices.tensor->GetStorageShape().GetDim(DIM_NUM_THREE - 1) :
             opParamInfo_.cmpSparseIndices.tensor->GetStorageShape().GetDim(DIM_NUM_FOUR - 1);
         OP_CHECK_IF(cmpSparseIndicesK != 512 && cmpSparseIndicesK != 1024,
-                    OP_LOGE(opName_, "K should be 512 or 1024, but got: %lld ", cmpSparseIndicesK),
+                    OP_LOGE(opName_, "K should be 512 or 1024, but got: %lld ",
+                        static_cast<long long>(cmpSparseIndicesK)),
                     return ge::GRAPH_FAILED);
     }
     return ge::GRAPH_SUCCESS;
@@ -1147,7 +1149,7 @@ ge::graphStatus TQSASTilingCheck::CheckSingleParaSinks() const
                 OP_LOGE(opName_, "sinks cannot be empty tensor."),
                 return ge::GRAPH_FAILED);
     if (opParamInfo_.sinks.tensor->GetStorageShape().GetDimNum() != DIM_NUM_ONE) {
-        OP_LOGE(opName_, "the dim num of %s is %u, it should be %u.", SINKS_NAME.c_str(),
+        OP_LOGE(opName_, "the dim num of %s is %zu, it should be %u.", SINKS_NAME.c_str(),
             opParamInfo_.sinks.tensor->GetStorageShape().GetDimNum(), DIM_NUM_ONE);
         return ge::GRAPH_FAILED;
     }
@@ -1373,10 +1375,10 @@ ge::graphStatus TQSASTilingCheck::CheckFeatureShape() const
                 return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(*opParamInfo_.oriMaskMode != 4,
-                OP_LOGE(opName_, "ori_mask_mode should be 4, but got %d", *opParamInfo_.oriMaskMode),
+                OP_LOGE(opName_, "ori_mask_mode should be 4, but got %u", *opParamInfo_.oriMaskMode),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(*opParamInfo_.cmpMaskMode != 3,
-                OP_LOGE(opName_, "cmp_mask_mode should be 3, but got %d", *opParamInfo_.cmpMaskMode),
+                OP_LOGE(opName_, "cmp_mask_mode should be 3, but got %u", *opParamInfo_.cmpMaskMode),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(oriWinRight_ != 0,
                 OP_LOGE(opName_, "ori_win_right should be 0, but got %ld", oriWinRight_),
@@ -1550,7 +1552,6 @@ void TurboQuantSparseAttnSharedkvTiling::CalcUbBmm(SASTilingInfo *tilingInfo)
 
 void TurboQuantSparseAttnSharedkvTiling::SplitBalanced(SASTilingInfo *tilingInfo)
 {
-    uint32_t s2Size = tilingInfo->s2Size;
     sInnerSizeAlign_ = Align(sInnerSize_, BYTE_BLOCK); // 元素个数按照基本块大小对齐
     mBaseSize_ = tilingInfo->perfMode == SASTemplateMode::SCFA_TEMPLATE_MODE ? \
         tilingInfo->gSize : (256 / tilingInfo->gSize) * tilingInfo->gSize;

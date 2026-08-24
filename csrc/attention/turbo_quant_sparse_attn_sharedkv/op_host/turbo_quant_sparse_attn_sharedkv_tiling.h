@@ -288,7 +288,7 @@ public:
 class TQSASTilingCheck {
 public:
     explicit TQSASTilingCheck(const SASTilingInfo &sasInfo) : sasInfo_(sasInfo) {};
-    ~TQSASTilingCheck() = default;
+    virtual ~TQSASTilingCheck() = default;
     virtual ge::graphStatus Process();
 
 private:

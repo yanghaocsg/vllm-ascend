@@ -19,7 +19,6 @@
 #include "register/tilingdata_base.h"
 #include "register/op_impl_registry.h"
 #include "log/log.h"
-#include "error_util.h"
 #include "tiling/platform/platform_ascendc.h"
 
 namespace optiling {
