@@ -28,8 +28,8 @@
 | 参数名            | 输入/输出/属性 | 描述  | 数据类型       | 数据格式   |
 |----------------------------|-----------|----------------------------------------------------------------------|----------------|------------|
 | q                     | 输入      | 对应公式中的$Q$。                                                     | BFLOAT16、FLOAT16  | ND |
-| ori\_kv               | 可选输入  | 对应公式中的$\tilde{K}和\tilde{V}$的一部分，为原始不经压缩的KV。 | BFLOAT16、FLOAT16 | ND |
-| cmp\_kv               | 可选输入  | 对应公式中的$\tilde{K}和\tilde{V}$的一部分，为经过压缩的KV；`kv_quant_mode=3`时为258B TQ4 slot。 | BFLOAT16、FLOAT16、UINT8 | ND |
+| ori\_kv               | 可选输入  | 对应公式中的$\tilde{K}和\tilde{V}$的一部分，为原始不经压缩的KV。          | BFLOAT16、FLOAT16 | ND |
+| cmp\_kv               | 可选输入  | 对应公式中的$\tilde{K}和\tilde{V}$的一部分，为经过压缩的KV。             | BFLOAT16、FLOAT16  | ND |
 | ori\_sparse\_indices  | 可选输入  | 代表离散取oriKvCache的索引。                                           | INT32              | ND |
 | cmp\_sparse\_indices  | 可选输入  | 代表离散取cmpKvCache的索引。                                           | INT32              | ND |
 | ori\_block\_table     | 可选输入  | 表示PageAttention中oriKvCache存储使用的block映射表。                   | INT32               | ND |
@@ -50,7 +50,6 @@
 | layout\_q             | 可选属性  | 用于标识输入`q`的数据排布格式，支持输入"TND"和"BSND"，默认值为"BSND"。     | STRING               | - |
 | layout\_kv            | 可选属性  | 用于标识输入`ori_kv`和`cmp_kv`的数据排布格式，支持输入"PA_ND"和"BSND"。   | STRING               | - |
 | return\_softmax_lse   | 可选属性  | 表示是否返回`softmax_lse`。True表示返回，False表示不返回，默认值为False。 | BOOL                | -  |
-| kv\_quant\_mode      | 可选属性  | KV存储模式。0为原FP16/BF16路径；3为DeepSeek V4压缩KV的TQ4路径，仅支持SCFA和PA_ND，`cmp_kv`物理slot末维为258。 | INT32 | - |
 | attention\_out        | 输出      | 公式中的输出。                                                          | BFLOAT16、FLOAT16   | ND |
 | softmax\_lse          | 输出      | 返回的`softmax_lse`。                                                 | FLOAT32             | ND |
 

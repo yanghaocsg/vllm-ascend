@@ -1447,7 +1447,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
 
         notify_kv_cache_written(layer_name)
         record_attention_compute_start()
-        attn_op = DeviceOperator.get_dsa_sparse_attn_op()
+        attn_op = DeviceOperator.get_dsa_sparse_attn_op(self.use_tq_latent)
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         if self.use_tq_latent:
             extra_attn_kwargs["kv_quant_mode"] = DSA_TQ_KV_QUANT_MODE

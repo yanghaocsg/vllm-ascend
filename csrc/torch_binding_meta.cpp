@@ -1081,13 +1081,27 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_meta(const at::Tenso
     const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_kv,
     const c10::optional<at::Tensor> &sinks, const c10::optional<at::Tensor> &metadata,
     double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode, int64_t ori_win_left,
-    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse,
-    int64_t kv_quant_mode)
+    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse)
 {
     std::string layout_q_str = std::string(layout_q);
     std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
 
     return output;
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_turbo_quant_sparse_attn_sharedkv_meta(
+    const at::Tensor &q, const c10::optional<at::Tensor> &ori_kv, const c10::optional<at::Tensor> &cmp_kv,
+    const c10::optional<at::Tensor> &ori_sparse_indices, const c10::optional<at::Tensor> &cmp_sparse_indices,
+    const c10::optional<at::Tensor> &ori_block_table, const c10::optional<at::Tensor> &cmp_block_table,
+    const c10::optional<at::Tensor> &cu_seqlens_q, const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv, const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_kv, const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata, double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode,
+    int64_t cmp_mask_mode, int64_t ori_win_left, int64_t ori_win_right, c10::string_view layout_q,
+    c10::string_view layout_kv, bool return_softmax_lse, int64_t kv_quant_mode)
+{
+    std::string layout_q_str = std::string(layout_q);
+    return construct_output_tensor(q, layout_q_str, return_softmax_lse);
 }
 
 at::Tensor npu_sparse_attn_sharedkv_metadata_meta(
@@ -1889,6 +1903,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_vllm_quant_lightning_indexer", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_meta);
     ops.impl("npu_vllm_quant_lightning_indexer_metadata", &vllm_ascend::meta::npu_vllm_quant_lightning_indexer_metadata_meta);
     ops.impl("npu_sparse_attn_sharedkv", &vllm_ascend::meta::npu_sparse_attn_sharedkv_meta);
+    ops.impl("npu_turbo_quant_sparse_attn_sharedkv",
+             &vllm_ascend::meta::npu_turbo_quant_sparse_attn_sharedkv_meta);
     ops.impl("npu_sparse_attn_sharedkv_metadata", &vllm_ascend::meta::npu_sparse_attn_sharedkv_metadata_meta);
     ops.impl("npu_hc_post", &vllm_ascend::meta::npu_hc_post_meta);
     ops.impl("npu_hc_pre", &vllm_ascend::meta::npu_hc_pre_meta);

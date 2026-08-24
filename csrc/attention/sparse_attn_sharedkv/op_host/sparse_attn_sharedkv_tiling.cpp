@@ -36,7 +36,7 @@ static const std::string ATTEN_OUT_NAME = "attn_out";
 const std::map<std::string, std::vector<ge::DataType>> DTYPE_SUPPORT_MAP = {
     {QUERY_NAME,                  {ge::DT_FLOAT16, ge::DT_BF16}},
     {ORI_KV_NAME,                    {ge::DT_FLOAT16, ge::DT_BF16}},
-    {CMP_KV_NAME,                  {ge::DT_FLOAT16, ge::DT_BF16, ge::DT_UINT8}},
+    {CMP_KV_NAME,                  {ge::DT_FLOAT16, ge::DT_BF16}},
     {ORI_SPARSE_INDICES,             {ge::DT_INT32}},
     {CMP_SPARSE_INDICES,               {ge::DT_INT32}},
     {ATTEN_OUT_NAME,              {ge::DT_FLOAT16, ge::DT_BF16}},
@@ -267,7 +267,6 @@ ge::graphStatus SASInfoParser::GetAttrParaInfo()
     opParamInfo_.layoutQ = attrs->GetStr(ATTR_LAYOUT_Q_INDEX);
     opParamInfo_.layoutKv = attrs->GetStr(ATTR_LAYOUT_KV_INDEX);
     opParamInfo_.returnSoftmaxLse = attrs->GetAttrPointer<bool>(ATTR_RETURN_SOFTMAX_LSE);
-    opParamInfo_.kvQuantMode = attrs->GetAttrPointer<int64_t>(ATTR_KV_QUANT_MODE_INDEX);
 
     OP_LOGI(context_->GetNodeName(), "GetAttrParaInfo end");
     return ge::GRAPH_SUCCESS;
@@ -816,7 +815,6 @@ void SASInfoParser::GenerateInfo(SASTilingInfo &sasInfo)
     sasInfo.kvLayout = kvLayout_;
     sasInfo.outLayout = outLayout_;
     sasInfo.returnSoftmaxLse = *opParamInfo_.returnSoftmaxLse;
-    sasInfo.kvQuantMode = opParamInfo_.kvQuantMode == nullptr ? 0U : static_cast<uint32_t>(*opParamInfo_.kvQuantMode);
 }
 
 ge::graphStatus SASInfoParser::Parse(SASTilingInfo &sasInfo)
@@ -887,7 +885,6 @@ void SASTilingCheck::Init()
     oriKvType_ = sasInfo_.oriKvType;
     cmpKvType_ = sasInfo_.cmpKvType;
     outputType_ = sasInfo_.outputType;
-    kvQuantMode_ = sasInfo_.kvQuantMode;
     cmpRatio_ = sasInfo_.cmpRatio;
     qLayout_ = sasInfo_.qLayout;
     oriSparseIndicesLayout_ = sasInfo_.oriSparseIndicesLayout;
@@ -1348,10 +1345,8 @@ ge::graphStatus SASTilingCheck::CheckFeatureShape() const
                 OP_LOGE(opName_, "ori_kv_head_dim only support %u, but got %u", DIM_LIMIT, oriKvHeadDim_),
                 return ge::GRAPH_FAILED);
     if (!(sasInfo_.perfMode == SASTemplateMode::SWA_TEMPLATE_MODE)){
-        const uint32_t expectedCmpKvHeadDim = kvQuantMode_ == 3 ? TQ4_SLOT_SIZE : DIM_LIMIT;
-        OP_CHECK_IF(cmpKvHeadDim_ != expectedCmpKvHeadDim,
-                    OP_LOGE(opName_, "cmp_kv_head_dim only support %u when kv_quant_mode is %u, but got %u",
-                             expectedCmpKvHeadDim, kvQuantMode_, cmpKvHeadDim_),
+        OP_CHECK_IF(cmpKvHeadDim_ != DIM_LIMIT,
+                    OP_LOGE(opName_, "cmp_kv_head_dim only support %u, but got %u", DIM_LIMIT, cmpKvHeadDim_),
                     return ge::GRAPH_FAILED);
     }
 
@@ -1359,21 +1354,6 @@ ge::graphStatus SASTilingCheck::CheckFeatureShape() const
                 OP_LOGE(opName_, "Head dimension data type check failed! qType[%s] must be the same with oriKvType[%s].",
                 SASDataTypeToSerialString(qType_).c_str(),
                 SASDataTypeToSerialString(oriKvType_).c_str()),
-                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ != 0 && kvQuantMode_ != 3,
-                OP_LOGE(opName_, "kv_quant_mode only supports 0 or 3, but got %u", kvQuantMode_),
-                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ == 3 && kvLayout_ != SASLayout::PA_ND,
-                OP_LOGE(opName_, "kv_quant_mode 3 only supports PA_ND KV layout."),
-                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.perfMode != SASTemplateMode::SCFA_TEMPLATE_MODE,
-                OP_LOGE(opName_, "kv_quant_mode 3 only supports the sparse compressor template."),
-                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ == 3 && sasInfo_.cmpKvStride % TQ4_SLOT_SIZE != 0,
-                OP_LOGE(opName_, "cmp_kv stride must be divisible by the 258-byte TQ slot size."),
-                return ge::GRAPH_FAILED);
-    OP_CHECK_IF(kvQuantMode_ == 3 && cmpKvType_ != ge::DT_UINT8,
-                OP_LOGE(opName_, "cmp_kv must be DT_UINT8 when kv_quant_mode is 3."),
                 return ge::GRAPH_FAILED);
 
     OP_CHECK_IF(*opParamInfo_.oriMaskMode != 4,
@@ -1470,8 +1450,8 @@ ge::graphStatus SASTilingCheck::CheckOriAndCmpKv() const
                         OP_LOGE(opName_, "cmp_kv cannot be empty tensor."),
                         return ge::GRAPH_FAILED);
         }
-        if (kvQuantMode_ == 0 && ge::GRAPH_SUCCESS != CheckDTypeConsistency(
-                cmpKvType_, oriKvType_, CMP_KV_NAME)) {
+        if (ge::GRAPH_SUCCESS != CheckDTypeConsistency(cmpKvType_,
+            oriKvType_, CMP_KV_NAME)) {
             return ge::GRAPH_FAILED;
         }
     }
@@ -1625,7 +1605,6 @@ ge::graphStatus SparseAttnSharedkvTiling::DoOpTiling(SASTilingInfo *tilingInfo)
     tilingData_.baseParams.set_oriWinRight(tilingInfo->oriWinRight);
     tilingData_.baseParams.set_sparseBlockSize(tilingInfo->sparseBlockSize);
     tilingData_.baseParams.set_returnSoftmaxLse(tilingInfo->returnSoftmaxLse);
-    tilingData_.baseParams.set_kvQuantMode(tilingInfo->kvQuantMode);
 
     tilingData_.cmpParams.set_cmpMaxBlockNumPerBatch(tilingInfo->cmpMaxBlockNumPerBatch);
     tilingData_.cmpParams.set_sparseBlockCount(tilingInfo->sparseBlockCount);

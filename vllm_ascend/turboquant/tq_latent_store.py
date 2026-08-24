@@ -6,7 +6,7 @@ scaled to N(0,1/512). The legacy slot is 320 B; DSV4 uses a compact 258 B slot c
 
 compress_kernel defaults to the legacy layout; compact output must be selected explicitly.
 The legacy read side is turbo_quant_sparse_flash_attention; DeepSeek V4 compact slots are
-dequantized by sparse_attn_sharedkv.
+dequantized by turbo_quant_sparse_attn_sharedkv.
 """
 import math
 import os as _os

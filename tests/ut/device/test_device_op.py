@@ -6,6 +6,21 @@ import torch
 from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
 
 
+def test_dsa_sparse_attn_op_selects_turbo_quant_variant():
+    with (
+        mock.patch(
+            "vllm_ascend.device.device_op.torch.ops._C_ascend.npu_sparse_attn_sharedkv",
+            create=True,
+        ) as sparse_attn,
+        mock.patch(
+            "vllm_ascend.device.device_op.torch.ops._C_ascend.npu_turbo_quant_sparse_attn_sharedkv",
+            create=True,
+        ) as turbo_quant_sparse_attn,
+    ):
+        assert BaseDeviceAdaptor.get_dsa_sparse_attn_op() is sparse_attn
+        assert BaseDeviceAdaptor.get_dsa_sparse_attn_op(True) is turbo_quant_sparse_attn
+
+
 def test_dsa_kv_compress_scatter_reinterprets_uint8_without_copy():
     cache = torch.arange(32, dtype=torch.uint8).reshape(2, 1, 16)
     source = torch.arange(16, dtype=torch.uint8).reshape(1, 1, 16)

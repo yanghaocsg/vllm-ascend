@@ -792,8 +792,10 @@ class BaseDeviceAdaptor:
         return {"device": str(device)}
 
     @staticmethod
-    def get_dsa_sparse_attn_op():
+    def get_dsa_sparse_attn_op(use_tq_latent=False):
         """Returns the sparse attention operator."""
+        if use_tq_latent:
+            return torch.ops._C_ascend.npu_turbo_quant_sparse_attn_sharedkv
         return torch.ops._C_ascend.npu_sparse_attn_sharedkv
 
     @staticmethod
@@ -1549,7 +1551,7 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return {"kv_quant_mode": 1}
 
     @staticmethod
-    def get_dsa_sparse_attn_op():
+    def get_dsa_sparse_attn_op(use_tq_latent=False):
         return torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv
 
     @staticmethod

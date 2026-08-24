@@ -1257,8 +1257,7 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_npu(const at::Tensor
     const c10::optional<at::Tensor> &seqused_q, const c10::optional<at::Tensor> &seqused_kv,
     const c10::optional<at::Tensor> &sinks, const c10::optional<at::Tensor> &metadata,
     double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode, int64_t cmp_mask_mode, int64_t ori_win_left,
-    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse,
-    int64_t kv_quant_mode)
+    int64_t ori_win_right, c10::string_view layout_q, c10::string_view layout_kv, bool return_softmax_lse)
 {
     std::string layout_q_str = std::string(layout_q);
     std::string layout_kv_str = std::string(layout_kv);
@@ -1281,7 +1280,42 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv_npu(const at::Tensor
     EXEC_NPU_CMD(aclnnSparseAttnSharedkv, q, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
         ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q, seqused_kv, sinks,
         metadata, softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_kv_stride, cmp_kv_stride, ori_win_left, ori_win_right, layout_q_ptr,
-        layout_kv_ptr, return_softmax_lse, kv_quant_mode, attn_out, softmax_lse);
+        layout_kv_ptr, return_softmax_lse, attn_out, softmax_lse);
+    return std::tuple<at::Tensor, at::Tensor>(attn_out, softmax_lse);
+}
+
+std::tuple<at::Tensor, at::Tensor> npu_turbo_quant_sparse_attn_sharedkv_npu(
+    const at::Tensor &q, const c10::optional<at::Tensor> &ori_kv, const c10::optional<at::Tensor> &cmp_kv,
+    const c10::optional<at::Tensor> &ori_sparse_indices, const c10::optional<at::Tensor> &cmp_sparse_indices,
+    const c10::optional<at::Tensor> &ori_block_table, const c10::optional<at::Tensor> &cmp_block_table,
+    const c10::optional<at::Tensor> &cu_seqlens_q, const c10::optional<at::Tensor> &cu_seqlens_ori_kv,
+    const c10::optional<at::Tensor> &cu_seqlens_cmp_kv, const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_kv, const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &metadata, double softmax_scale, int64_t cmp_ratio, int64_t ori_mask_mode,
+    int64_t cmp_mask_mode, int64_t ori_win_left, int64_t ori_win_right, c10::string_view layout_q,
+    c10::string_view layout_kv, bool return_softmax_lse, int64_t kv_quant_mode)
+{
+    std::string layout_q_str = std::string(layout_q);
+    std::string layout_kv_str = std::string(layout_kv);
+    std::tuple<at::Tensor, at::Tensor> output = construct_output_tensor(q, layout_q_str, return_softmax_lse);
+    at::Tensor attn_out = std::get<0>(output);
+    at::Tensor softmax_lse = std::get<1>(output);
+    int64_t ori_kv_stride = 0;
+    int64_t cmp_kv_stride = 0;
+    if (ori_kv.has_value()) {
+        ori_kv_stride = ori_kv.value().stride(0);
+    }
+    if (cmp_kv.has_value()) {
+        cmp_kv_stride = cmp_kv.value().stride(0);
+    }
+
+    char *layout_q_ptr = const_cast<char *>(layout_q_str.c_str());
+    char *layout_kv_ptr = const_cast<char *>(layout_kv_str.c_str());
+    EXEC_NPU_CMD(aclnnTurboQuantSparseAttnSharedkv, q, ori_kv, cmp_kv, ori_sparse_indices, cmp_sparse_indices,
+        ori_block_table, cmp_block_table, cu_seqlens_q, cu_seqlens_ori_kv, cu_seqlens_cmp_kv, seqused_q, seqused_kv,
+        sinks, metadata, softmax_scale, cmp_ratio, ori_mask_mode, cmp_mask_mode, ori_kv_stride, cmp_kv_stride,
+        ori_win_left, ori_win_right, layout_q_ptr, layout_kv_ptr, return_softmax_lse, kv_quant_mode, attn_out,
+        softmax_lse);
     return std::tuple<at::Tensor, at::Tensor>(attn_out, softmax_lse);
 }
 
@@ -2661,11 +2695,41 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "int ori_win_right=0, "
             "str layout_q=\"BSND\", "
             "str layout_kv=\"PA_ND\", "
-            "bool return_softmax_lse=False, "
-            "int kv_quant_mode=0"
+            "bool return_softmax_lse=False"
         ") -> (Tensor out, Tensor softmax_lse)"
         );
     ops.impl("npu_sparse_attn_sharedkv", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attn_sharedkv_npu);
+
+    ops.def(
+        "npu_turbo_quant_sparse_attn_sharedkv("
+            "Tensor q, *, "
+            "Tensor? ori_kv=None, "
+            "Tensor? cmp_kv=None, "
+            "Tensor? ori_sparse_indices=None, "
+            "Tensor? cmp_sparse_indices=None, "
+            "Tensor? ori_block_table=None, "
+            "Tensor? cmp_block_table=None, "
+            "Tensor? cu_seqlens_q=None, "
+            "Tensor? cu_seqlens_ori_kv=None, "
+            "Tensor? cu_seqlens_cmp_kv=None, "
+            "Tensor? seqused_q=None, "
+            "Tensor? seqused_kv=None, "
+            "Tensor? sinks=None, "
+            "Tensor? metadata=None, "
+            "float softmax_scale=1, "
+            "int cmp_ratio=4, "
+            "int ori_mask_mode=4, "
+            "int cmp_mask_mode=3, "
+            "int ori_win_left=127, "
+            "int ori_win_right=0, "
+            "str layout_q=\"TND\", "
+            "str layout_kv=\"PA_ND\", "
+            "bool return_softmax_lse=False, "
+            "int kv_quant_mode=3"
+        ") -> (Tensor out, Tensor softmax_lse)"
+        );
+    ops.impl("npu_turbo_quant_sparse_attn_sharedkv", torch::kPrivateUse1,
+             &vllm_ascend::npu_turbo_quant_sparse_attn_sharedkv_npu);
 
     ops.def(
         "npu_sparse_attn_sharedkv_metadata("

@@ -137,7 +137,6 @@ private:
     GlobalTensor<Q_T> queryGm;
     GlobalTensor<KV_T> oriKvGm;
     GlobalTensor<KV_T> cmpKvGm;
-    GlobalTensor<uint8_t> cmpTqGm;
     GlobalTensor<SINKS_T> sinksGm;
 
     GlobalTensor<OUT_T> attentionOutGm;
@@ -218,7 +217,6 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::InitTilingData()
     constInfo.actualLenDimsQ = tilingData->baseParams.actualLenDimsQ;
     constInfo.actualLenDimsKV = tilingData->baseParams.actualLenDimsKV;
     constInfo.returnSoftmaxLse = tilingData->baseParams.returnSoftmaxLse;
-    constInfo.kvQuantMode = tilingData->baseParams.kvQuantMode;
     // innerSplitParams
     constInfo.mBaseSize = constInfo.gSize;
     constInfo.s2BaseSize = tilingData->baseParams.s2BaseSize;
@@ -425,11 +423,7 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::Init(
     // init global buffer
     queryGm.SetGlobalBuffer((__gm__ Q_T *)query);
     oriKvGm.SetGlobalBuffer((__gm__ KV_T *)oriKV);
-    if (constInfo.kvQuantMode == 3) {
-        cmpTqGm.SetGlobalBuffer((__gm__ uint8_t *)cmpKV);
-    } else {
-        cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
-    }
+    cmpKvGm.SetGlobalBuffer((__gm__ KV_T *)cmpKV);
 
     if (sinks != nullptr) {
         sinksGm.SetGlobalBuffer((__gm__ SINKS_T *)sinks);
@@ -482,7 +476,7 @@ __aicore__ inline void SparseAttnSharedkvScfa<SAST>::Init(
 
     if ASCEND_IS_AIV {
         vectorBlock.InitParams(constInfo, tilingData);
-        vectorBlock.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, oriKvGm, cmpKvGm, cmpTqGm, oriBlockTableGm,
+        vectorBlock.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, oriKvGm, cmpKvGm, oriBlockTableGm,
                                          cmpBlockTableGm);
         vectorBlock.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm, actualSeqLengthsKVGm, topKGm,
                                          sinksGm, softmaxLseGm);

@@ -1970,7 +1970,7 @@ class AscendDSAImpl(DSAAttentionImpl):
             self._write_dsa_kv_cache(swa_kv_cache, kv, swa_prefill_metadata.slot_mapping)
 
         q = self._transform_dsa_query(q)
-        attn_op = DeviceOperator.get_dsa_sparse_attn_op()
+        attn_op = DeviceOperator.get_dsa_sparse_attn_op(self.use_tq_latent)
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         if self.use_tq_latent:
             extra_attn_kwargs["kv_quant_mode"] = DSA_TQ_KV_QUANT_MODE
@@ -2413,7 +2413,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         notify_kv_cache_written(layer_name)
         record_attention_compute_start()
         q = self._transform_dsa_query(q)
-        attn_op = DeviceOperator.get_dsa_sparse_attn_op()
+        attn_op = DeviceOperator.get_dsa_sparse_attn_op(self.use_tq_latent)
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         if self.use_tq_latent:
             extra_attn_kwargs["kv_quant_mode"] = DSA_TQ_KV_QUANT_MODE
