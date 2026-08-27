@@ -46,7 +46,6 @@ constexpr float NORM_EPS = 1e-16f;
 constexpr float NIBBLE_SIGN_THRESHOLD = 8.0f;
 constexpr float NIBBLE_SIGN_OFFSET = -16.0f;
 constexpr uint32_t OUTPUT_MODE_COMPACT_CORRECTED = 1;
-constexpr float CENTROID_BYTE_STRIDE = sizeof(float);
 
 __aicore__ inline uint32_t AlignUpTo(uint32_t value, uint32_t align) { return (value + align - 1) / align * align; }
 
@@ -190,14 +189,33 @@ private:
         if (compactCorrected_) {
             // The read side reconstructs centroid[nibble] * scale. Correct the original latent norm by
             // the selected codebook vector norm so the reconstructed row retains the intended magnitude.
-            Muls(tmp, nib, CENTROID_BYTE_STRIDE, elems);
-            PipeBarrier<PIPE_V>();
-            LocalTensor<int32_t> codeOffsets = sel.ReinterpretCast<int32_t>();
-            LocalTensor<uint32_t> unsignedCodeOffsets = sel.ReinterpretCast<uint32_t>();
-            Cast(codeOffsets, tmp, RoundMode::CAST_ROUND, elems);
-            PipeBarrier<PIPE_V>();
             LocalTensor<float> cent = centBuf_.Get<float>();
-            Gather(tmp, cent, unsignedCodeOffsets, 0, elems);
+            // Select the codebook value through vector masks so the index remains a vector value.
+            Duplicate(tmp, cent.GetValue(0), elems);
+            // Keep scalar thresholds as compile-time constants for aicore compilation.
+#define TQ_SELECT_CENTROID(C)                                             \
+    CompareScalar(mask, nib, static_cast<float>(C), CMPMODE::GE, elems);  \
+    PipeBarrier<PIPE_V>();                                                \
+    Duplicate(sel, cent.GetValue(C), elems);                              \
+    PipeBarrier<PIPE_V>();                                                \
+    Select(tmp, mask, sel, tmp, SELMODE::VSEL_TENSOR_TENSOR_MODE, elems); \
+    PipeBarrier<PIPE_V>();
+            TQ_SELECT_CENTROID(1)
+            TQ_SELECT_CENTROID(2)
+            TQ_SELECT_CENTROID(3)
+            TQ_SELECT_CENTROID(4)
+            TQ_SELECT_CENTROID(5)
+            TQ_SELECT_CENTROID(6)
+            TQ_SELECT_CENTROID(7)
+            TQ_SELECT_CENTROID(8)
+            TQ_SELECT_CENTROID(9)
+            TQ_SELECT_CENTROID(10)
+            TQ_SELECT_CENTROID(11)
+            TQ_SELECT_CENTROID(12)
+            TQ_SELECT_CENTROID(13)
+            TQ_SELECT_CENTROID(14)
+            TQ_SELECT_CENTROID(15)
+#undef TQ_SELECT_CENTROID
             PipeBarrier<PIPE_V>();
             Mul(tmp, tmp, tmp, elems);
             PipeBarrier<PIPE_V>();

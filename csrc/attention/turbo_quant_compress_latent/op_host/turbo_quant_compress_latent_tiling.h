@@ -54,7 +54,7 @@ inline int64_t TqCompressSlotSize(int64_t headDim)
 inline int64_t TqCompressOutputSlotSize(int64_t headDim, int64_t outputMode)
 {
     return outputMode == TQ_COMPRESS_OUTPUT_COMPACT_CORRECTED ? headDim / 2 + TQ_COMPRESS_SCALE_BYTES :
-                                                               TqCompressSlotSize(headDim);
+                                                                TqCompressSlotSize(headDim);
 }
 
 inline int64_t TqCompressAlign64(int64_t value)

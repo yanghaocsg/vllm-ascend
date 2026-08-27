@@ -48,15 +48,23 @@ kv_hat[d] = centroid[code[d]] * corrected_scale
 - `kv_quant_mode` 仅支持 3，默认值为 3。
 - `layout_q` 仅支持 `TND`，`layout_kv` 仅支持 `PA_ND`。
 - 仅支持 sparse-compressor（SCFA）模板；`ori_kv` 和 `cmp_kv` 均须存在。
-- `cmp_sparse_indices`、两份 block table、`cu_seqlens_q`、`seqused_kv`、`sinks` 和 `metadata` 均为必需输入；`ori_sparse_indices` 必须为空。
+- `cmp_sparse_indices`、两份 block table、`cu_seqlens_q`、`seqused_kv`、`sinks` 和 `metadata` 均为必需输入；`ori_sparse_indices` 与 `seqused_q` 必须为空。
 - `cmp_kv_stride` 以字节为单位，必须是 258 的正整数倍。
 - `q`、`ori_kv` 和 `attn_out` 支持 FP16/BF16；`cmp_kv` 必须为 UINT8。
+- query head 数须为 4 的倍数，KV head 数固定为 1，head dim 固定为 512。
+- `cmp_sparse_indices` 最后一维支持 512 或 1024；`cmp_ratio` 支持 4 和 128，TurboQuant 4bit 调用使用 4。
+- `ori_mask_mode=4`、`cmp_mask_mode=3`、`ori_win_right=0`；`ori_win_left` 必须为非负值，
+  由 vLLM-Ascend 按模型的 `sliding_window - 1` 传入（默认值 127 用于兼容现有调用）。
+- `sinks` 为 FP32，shape 为 `[num_query_heads]`；`metadata` 为 1024 个 INT32。
+- `return_softmax_lse=false` 时第二输出为空；为 true 时输出 shape 为 `q.shape[:-1] + [1]`，dtype 为 FP32。
 
 ## 实现结构
 
 - `op_host/`：独立 OpDef、推形和 tiling；在 host 阶段收窄 dtype、layout、slot 和模板范围。
 - `op_kernel/`：SCFA cube/vector 流程；vector0 将稀疏 slot 搬入 UB、按固定码本批量解压，随后复用
   原 sparse attention 的 MM1、softmax 和 MM2 流水。
+- `vllm_ascend/turboquant/`：负责 Hadamard 前后变换、TurboQuant 压缩写入和 shared-KV 调用参数编排；
+  压缩写侧通过 `output_mode=1` 生成 258B compact corrected slot。
 - `tests/pytest/`：不依赖 NPU 的协议数学测试。
 
 压缩写侧由 `cann/ops-nn` 的 `TurboQuantCompressLatent` 提供。默认 `output_mode=0` 保持原
