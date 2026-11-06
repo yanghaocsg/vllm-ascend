@@ -110,6 +110,24 @@ def leapquant_flush_state_rows(
 
     rows = due_rows.to(state_indices.device)
     slot_ids = state_indices.index_select(0, rows)
+
+    # Fused triton-ascend path (PR2): one in-place kernel launch instead
+    # of gather + ~15 torch ops + scatter.  Scoped to plain NPU pools with
+    # power-of-two head dims; the KDA gather/scatter plan keeps the torch
+    # path until its flush variant lands.
+    v_dim, k_dim = state.shape[-2], state.shape[-1]
+    if (
+        getattr(config, "kernel_backend", "torch") == "triton"
+        and state_copy is None
+        and state.device.type != "cpu"
+        and v_dim & (v_dim - 1) == 0
+        and k_dim & (k_dim - 1) == 0
+    ):
+        from vllm_ascend.ops.triton.leapquant import leapquant_flush_triton
+
+        leapquant_flush_triton(state, slot_ids, compensator_tokens=config.compensator_tokens)
+        return
+
     flushed = None
     if state_copy is not None and state.device.type != "cpu":
         present = torch.ones(slot_ids.shape[0], dtype=torch.bool, device=slot_ids.device)

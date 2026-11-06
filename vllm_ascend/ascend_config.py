@@ -305,6 +305,12 @@ class LeapQuantConfig:
     compensator_tokens: int = 4
     # State checkpoint bit width. Only int8 is implemented (PR1).
     bits: int = 8
+    # Flush implementation: "torch" = PR1 functional path (gather /
+    # leap_window_flush / scatter), "triton" = fused triton-ascend kernel
+    # (single launch, in-place on the pool). Falls back to "torch" on CPU,
+    # for state pools with non-power-of-two head dims, and on the KDA
+    # gather/scatter plan until the KDA flush variant lands.
+    kernel_backend: Literal["torch", "triton"] = "torch"
 
     @model_validator(mode="after")
     def _validate(self):
@@ -316,12 +322,18 @@ class LeapQuantConfig:
             )
         if self.bits != 8:
             raise ValueError(f"leapquant_config.bits supports only 8 in this milestone; got {self.bits}")
+        if self.kernel_backend == "triton" and self.compensator_tokens > 16:
+            raise ValueError(
+                "leapquant_config.kernel_backend='triton' supports compensator_tokens <= 16; "
+                f"got {self.compensator_tokens}"
+            )
         return self
 
     @property
     def summary(self) -> str:
         return (
-            f"LeapQuant enabled: window={self.window}, compensator_tokens={self.compensator_tokens}, bits={self.bits}"
+            f"LeapQuant enabled: window={self.window}, compensator_tokens={self.compensator_tokens}, "
+            f"bits={self.bits}, kernel_backend={self.kernel_backend}"
         )
 
 
