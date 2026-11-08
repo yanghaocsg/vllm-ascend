@@ -39,6 +39,8 @@ from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
 from vllm_ascend.quantization.methods.mamba_state.leapquant import (
     leapquant_config_or_none,
     leapquant_flush_state_rows,
+    leapquant_payload_pool_for_layer,
+    leapquant_payload_state_extension,
 )
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicLinearMethod,
@@ -257,6 +259,23 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
 
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendGDNHostMetadataBackend
+
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        shapes = super().get_state_shape()
+        # LeapQuant payload pool (M3.2b): ride the engine mamba-page
+        # allocation as a trailing uint8 state component.  The temporal
+        # (heads, V, K) state is the last base component.
+        extension = leapquant_payload_state_extension(shapes)
+        if extension is not None:
+            shapes = (*shapes, extension[0])
+        return shapes
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        dtypes = super().get_state_dtype()
+        if (extension := leapquant_payload_state_extension(super().get_state_shape())) is not None:
+            dtypes = (*dtypes, extension[1])
+        return dtypes
+
 
     def forward(
         self,
@@ -572,7 +591,9 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             is_preprocessed=beta_is_preprocessed,
         )
 
-        conv_state, recurrent_state = self.kv_cache
+        # LeapQuant payload_pool appends a trailing payload component to the
+        # bound kv-cache list (M3.2b); index instead of unpacking.
+        conv_state, recurrent_state = self.kv_cache[0], self.kv_cache[1]
         conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
         spec_masks = attn_metadata.spec_sequence_masks
         spec_token_indices = attn_metadata.spec_token_indx
@@ -743,6 +764,11 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             and attn_metadata.non_spec_state_indices_tensor is not None
             and (leapquant_seq_lens := getattr(attn_metadata, "leapquant_seq_lens", None)) is not None
         ):
+            payload = (
+                leapquant_payload_pool_for_layer(self, self.kv_cache, recurrent_state, leapquant_config)
+                if leapquant_config.payload_pool
+                else None
+            )
             leapquant_flush_state_rows(
                 recurrent_state,
                 attn_metadata.non_spec_state_indices_tensor,
@@ -751,6 +777,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 state_copy=getattr(self, "_ascend_kda_state_copy", None)
                 if getattr(self, "_kda_state_copy_ready", False)
                 else None,
+                payload=payload,
             )
 
         # Reuse the caller-owned result buffer. FULL graphs can leave rows

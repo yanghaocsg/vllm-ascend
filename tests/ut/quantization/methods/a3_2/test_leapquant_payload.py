@@ -208,6 +208,121 @@ class TestLeapQuantPayload(unittest.TestCase):
         self.assertTrue(torch.equal(pool, pool))  # pool untouched by failures
 
 
+def _engine_page_views(slots, heads, v_dim, k_dim, rank, *, page_pad=12, device=DEVICE):
+    """Emulate the Ascend mamba-page allocation for a GDN layer.
+
+    Mirrors ``_adjust_dsv4_kv_layout``: one int8 allocation, per-state views
+    carved by byte offset with the *page* as the block stride, plus trailing
+    page padding so the payload view is genuinely strided.
+    """
+    hbb = PayloadLayout(1, heads, v_dim, k_dim, rank).head_block_bytes
+    conv_dim, width = 512, 4
+    conv_bytes, ssm_bytes = conv_dim * width * 2, heads * v_dim * k_dim * 4
+    page = conv_bytes + ssm_bytes + heads * hbb + page_pad
+    raw = torch.zeros(slots * page, dtype=torch.int8, device=device)
+
+    def carve(shape, dtype, off):
+        esz = torch.empty((), dtype=dtype).element_size()
+        dense = torch.empty(shape).stride()
+        return torch.as_strided(raw.view(dtype), shape, (page // esz, *dense[1:]), off // esz)
+
+    conv = carve((slots, conv_dim, width), torch.bfloat16, 0)
+    ssm = carve((slots, heads, v_dim, k_dim), torch.float32, conv_bytes)
+    payload = carve((slots, heads, hbb), torch.uint8, conv_bytes + ssm_bytes)
+    return raw, page, conv, ssm, payload
+
+
+class TestLeapQuantEnginePool(unittest.TestCase):
+    """Payload riding the engine mamba page (M3.2b allocation path)."""
+
+    def test_engine_strided_pool_dual_write(self):
+        """Strided ssm + payload views out of one page: the flush must land
+        in the payload region only and keep the page padding / conv bytes /
+        non-due slots untouched."""
+        from vllm_ascend.ops.triton.leapquant import leapquant_flush_triton
+
+        slots, heads, rank = 8, 4, 4
+        torch.manual_seed(21)
+        raw, page, conv, ssm, payload_view = _engine_page_views(slots, heads, 128, 128, rank)
+        ssm.copy_(torch.randn_like(ssm))
+        raw_before = raw.clone()
+        slot_ids = torch.tensor([1, 5], device=DEVICE, dtype=torch.int64)
+
+        pool = LeapQuantPayloadPool(payload_view, PayloadLayout(slots, heads, 128, 128, rank))
+        self.assertEqual(pool.slot_stride_bytes, page)
+        self.assertEqual(pool.head_stride_bytes, PayloadLayout(1, heads, 128, 128, rank).head_block_bytes)
+
+        reference = _reference_flush(ssm.cpu(), slot_ids.cpu(), rank).to(DEVICE)
+        leapquant_flush_triton(ssm, slot_ids, compensator_tokens=rank, payload=pool, rewrite_state=True)
+        torch.npu.synchronize()
+
+        rows = slot_ids.to(torch.int64)
+        step = _code_step_bound(ssm.cpu(), slot_ids.cpu(), rank)
+        scale = ssm[rows].abs().mean().item() + 1.0
+        self.assertLess((ssm[rows] - reference[rows]).abs().max().item(), 2.0 * step + 1e-5 * scale)
+        recon = pool.reconstruct_rows(slot_ids).cpu()
+        self.assertLess(
+            (recon - reference[rows].cpu()).abs().max().item(), 2.0 * step + 1e-5 * scale
+        )
+
+        # everything outside the due regions is bit-untouched: conv plane,
+        # page padding, non-due slots.  Due slots may change in their ssm
+        # (dual-write) and payload regions only.
+        raw_after = raw.clone()
+        hbb = pool.head_stride_bytes
+        conv_bytes = conv.shape[1] * conv.shape[2] * 2  # per-slot bf16 conv plane
+        ssm_bytes = heads * 128 * 128 * 4
+        payload_off = conv_bytes + ssm_bytes
+        flat_mask = (raw_before != raw_after).view(slots, page)
+        for s in range(slots):
+            if s in (1, 5):
+                self.assertFalse(flat_mask[s, :conv_bytes].any(), f"slot {s}: conv bytes changed")
+                self.assertFalse(
+                    flat_mask[s, payload_off + heads * hbb :].any(), f"slot {s}: padding changed"
+                )
+            else:
+                self.assertFalse(flat_mask[s].any(), f"slot {s}: non-due slot changed")
+
+    def test_engine_pool_wrapper_rejects_misaligned(self):
+        """A view whose slot stride breaks 4-byte field alignment is rejected."""
+        slots, heads = 4, 2
+        hbb = PayloadLayout(1, heads, 128, 128, 4).head_block_bytes
+        bad_stride = PayloadLayout(1, heads, 128, 128, 4).slot_bytes + 2
+        raw = torch.zeros(slots * bad_stride, dtype=torch.uint8, device=DEVICE)
+        view = torch.as_strided(raw, (slots, heads, hbb), (bad_stride, hbb, 1))
+        with self.assertRaises(ValueError):
+            LeapQuantPayloadPool(view, PayloadLayout(slots, heads, 128, 128, 4))
+
+    def test_state_extension_helper(self):
+        """get_state_shape/dtype extension: off -> None, on -> uint8 component."""
+        import types
+        from unittest.mock import patch
+
+        from vllm_ascend.ascend_config import LeapQuantConfig
+        from vllm_ascend.quantization.methods.mamba_state.leapquant import (
+            leapquant_payload_state_extension as ext,
+        )
+
+        conv = (512, 4)
+        temporal = (8, 128, 128)
+        # engine off (no AscendConfig singleton in UT) -> no extension
+        self.assertIsNone(ext((conv, temporal)))
+
+        cfg = LeapQuantConfig(
+            enabled=True, window=16, compensator_tokens=4, kernel_backend="triton", payload_pool=True
+        )
+        fake = types.SimpleNamespace(leapquant_config=cfg)
+        with patch("vllm_ascend.ascend_config.get_ascend_config", return_value=fake):
+            shape, dtype = ext((conv, temporal))
+        self.assertEqual(shape, (8, PayloadLayout(1, 8, 128, 128, 4).head_block_bytes))
+        self.assertEqual(dtype, torch.uint8)
+
+        # non-power-of-two head dims fail fast at spec-build time
+        with patch("vllm_ascend.ascend_config.get_ascend_config", return_value=fake):
+            with self.assertRaises(ValueError):
+                ext(((512, 4), (8, 96, 128)))
+
+
 class TestLeapQuantRuntimePayload(unittest.TestCase):
     """End-to-end flush-hook wiring: config gate -> runtime -> kernel."""
 

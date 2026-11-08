@@ -206,6 +206,10 @@ Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
 _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
 _GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape
 _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backend
+# LeapQuant payload pool (M3.2b): the graft must carry the dtype side of the
+# optional payload state component too (the 310p branch below installs its
+# own and stays untouched — LeapQuant is A3-only).
+_GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention.get_state_dtype
 
 if get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
     from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310

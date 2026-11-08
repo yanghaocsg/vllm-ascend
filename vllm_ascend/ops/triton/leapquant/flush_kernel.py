@@ -485,8 +485,11 @@ def leapquant_flush_triton(
         )
         return
 
-    lay = payload.layout
-    hb, sb = lay.head_block_bytes, lay.slot_bytes
+    # Actual byte strides: engine pools are strided views over the mamba page
+    # (slot stride = whole conv+ssm+payload page, possibly padded), so take
+    # the strides from the pool buffer rather than the contiguous layout.
+    hb = payload.head_stride_bytes
+    sb = payload.slot_stride_bytes
     _leapquant_payload_encode_kernel[grid](
         state,
         due,

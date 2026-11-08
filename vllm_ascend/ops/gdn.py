@@ -54,6 +54,8 @@ from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_
 from vllm_ascend.quantization.methods.mamba_state.leapquant import (
     leapquant_config_or_none,
     leapquant_flush_state_rows,
+    leapquant_payload_pool_for_layer,
+    leapquant_payload_state_extension,
 )
 from vllm_ascend.utils import vllm_version_is
 
@@ -362,8 +364,11 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
 
     def get_state_shape(
         self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+    ) -> tuple[tuple[int, ...], ...]:
+        # Self-contained (no helper-method calls): this method is grafted
+        # onto the Qwen3.5 model GDN class (patch_qwen3_5), whose instances
+        # only carry the attributes referenced here.
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -372,6 +377,29 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+        # LeapQuant payload pool (M3.2b): ride the engine mamba-page
+        # allocation as a trailing uint8 state component.
+        extension = leapquant_payload_state_extension(shapes)
+        if extension is not None:
+            shapes = (*shapes, extension[0])
+        return shapes
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        # Explicit base-class call (not super()): same grafting reason as
+        # get_state_shape — resolve against the graft target's MRO.
+        dtypes = GatedDeltaNetAttention.get_state_dtype(self)
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
+            self.tp_size,
+            self.num_k_heads,
+            self.num_v_heads,
+            self.head_k_dim,
+            self.head_v_dim,
+            self.conv_kernel_size,
+            self.num_spec,
+        )
+        if (extension := leapquant_payload_state_extension(shapes)) is not None:
+            dtypes = (*dtypes, extension[1])
+        return dtypes
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         return
@@ -955,11 +983,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             and non_spec_state_indices_tensor is not None
             and (leapquant_seq_lens := getattr(attn_metadata, "leapquant_seq_lens", None)) is not None
         ):
+            payload = (
+                leapquant_payload_pool_for_layer(self, self_kv_cache, ssm_state, leapquant_config)
+                if leapquant_config.payload_pool
+                else None
+            )
             leapquant_flush_state_rows(
                 ssm_state,
                 non_spec_state_indices_tensor,
                 leapquant_seq_lens,
                 config=leapquant_config,
+                payload=payload,
             )
 
         # 3. Merge core attention output

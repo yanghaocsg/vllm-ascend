@@ -28,11 +28,20 @@ Field order keeps every offset a multiple of 4 (V/K are powers of two in
 every supported model).  ``leapquant_flush_triton(..., payload=pool)`` on
 the triton side fills due rows; ``reconstruct_rows`` is the torch-side
 read-back used by unit tests and (later) host-side tooling.
+
+The buffer may be **strided**: the engine allocation (M3.2b) stores the
+payload as the last state component of the mamba page, so the pool view is
+``[slots, heads, head_block_bytes]`` uint8 with a slot stride of the whole
+(possibly padded) page — conv + ssm + payload (+ padding).  Heads stay
+densely packed inside the page and every field offset is 4-byte aligned,
+so per-field ``as_strided`` views over ``buffer.view(dtype)`` reach the
+same bytes as in the standalone contiguous pool.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -40,7 +49,15 @@ from vllm_ascend.quantization.methods.mamba_state.leapquant.state import (
     reconstruct_state,
 )
 
-__all__ = ["PayloadLayout", "LeapQuantPayloadPool"]
+if TYPE_CHECKING:
+    from vllm_ascend.ascend_config import LeapQuantConfig
+
+__all__ = [
+    "PayloadLayout",
+    "LeapQuantPayloadPool",
+    "leapquant_payload_state_extension",
+    "leapquant_payload_pool_for_layer",
+]
 
 
 @dataclass(frozen=True)
@@ -129,22 +146,60 @@ class PayloadLayout:
 class LeapQuantPayloadPool:
     """One uint8 buffer unpacked into the per-field payload views.
 
-    The pool owns nothing but the buffer; the engine-side allocation
-    (``get_state_dtype``/``bind_kv_cache`` reinterpret) plugs in at M3.2b.
+    The pool owns nothing but the buffer.  A standalone pool is
+    ``allocate``-d as a contiguous ``[slots, heads, head_block_bytes]``
+    uint8 tensor; the engine allocation (M3.2b) instead supplies the
+    strided view carved out of the mamba page as the last state component
+    (slot stride = whole page, heads densely packed).  Both go through the
+    same constructor; ``slot_stride_bytes``/``head_stride_bytes`` report
+    the actual byte strides the flush kernel must use.
     """
 
     layout: PayloadLayout
-    buffer: torch.Tensor  # uint8 [total_bytes]
+    buffer: torch.Tensor  # uint8 [slots, heads, head_block_bytes], may be strided
 
     def __init__(self, buffer: torch.Tensor, layout: PayloadLayout) -> None:
-        if buffer.dtype != torch.uint8 or buffer.ndim != 1:
-            raise ValueError("buffer must be a flat uint8 tensor")
-        if buffer.numel() != layout.total_bytes:
+        if buffer.dtype != torch.uint8 or buffer.ndim != 3:
             raise ValueError(
-                f"buffer has {buffer.numel()} bytes, layout needs {layout.total_bytes}"
+                f"buffer must be a uint8 [slots, heads, head_block_bytes] tensor, "
+                f"got dtype={buffer.dtype} ndim={buffer.ndim}"
+            )
+        if tuple(buffer.shape) != (layout.slots, layout.heads, layout.head_block_bytes):
+            raise ValueError(
+                f"buffer shape {tuple(buffer.shape)} does not match layout "
+                f"({layout.slots}, {layout.heads}, {layout.head_block_bytes})"
+            )
+        # Heads must be densely packed inside the slot; the slot stride may
+        # exceed slot_bytes (engine pages hold conv+ssm+payload+padding).
+        if buffer.stride(2) != 1:
+            raise ValueError(f"payload buffer inner stride != 1: {buffer.stride()}")
+        if buffer.stride(1) != layout.head_block_bytes:
+            raise ValueError(
+                f"payload head stride {buffer.stride(1)} != head_block_bytes "
+                f"{layout.head_block_bytes} (heads must be densely packed)"
+            )
+        for name, stride in (("slot", buffer.stride(0)), ("storage_offset", buffer.storage_offset())):
+            if stride % 4 or stride < 0:
+                raise ValueError(
+                    f"payload {name} {stride} breaks 4-byte field alignment "
+                    "(fp32/fp16/int32 payload fields)"
+                )
+        if buffer.stride(0) < layout.slot_bytes:
+            raise ValueError(
+                f"payload slot stride {buffer.stride(0)} < slot_bytes {layout.slot_bytes}"
             )
         self.layout = layout
         self.buffer = buffer
+
+    @property
+    def head_stride_bytes(self) -> int:
+        """Actual per-head byte stride (== ``head_block_bytes``)."""
+        return self.buffer.stride(1)
+
+    @property
+    def slot_stride_bytes(self) -> int:
+        """Actual per-slot byte stride (engine pages: the whole page)."""
+        return self.buffer.stride(0)
 
     @classmethod
     def allocate(
@@ -158,37 +213,36 @@ class LeapQuantPayloadPool:
         device: torch.device,
     ) -> "LeapQuantPayloadPool":
         layout = PayloadLayout(slots, heads, v_dim, k_dim, rank)
-        buffer = torch.zeros(layout.total_bytes, dtype=torch.uint8, device=device)
+        buffer = torch.zeros(
+            slots, heads, layout.head_block_bytes, dtype=torch.uint8, device=device
+        )
         return cls(buffer, layout)
 
     # ---- unpacked views (all alias self.buffer) ------------------------
     def _view(self, name: str, dtype: torch.dtype, per_head_shape: tuple[int, ...]):
         lay = self.layout
         off = lay.field_offsets()[name]
-        field_numel = 1
-        for s in per_head_shape:
-            field_numel *= s
-        # A flat uint8 -> dtype reinterpret of the whole buffer, then slice
-        # head blocks.  head_block_bytes is a multiple of the dtype size, so
-        # every field stays aligned regardless of the preceding fields.
-        if lay.head_block_bytes % torch.empty((), dtype=dtype).element_size() != 0:
-            raise ValueError("head block not aligned for dtype")
-        flat = self.buffer.view(dtype)
-        per_head_fields = lay.head_block_bytes // torch.empty((), dtype=dtype).element_size()
-        # fields of one dtype are contiguous inside the head block only if no
-        # differently-sized field interleaves; here each field IS one dtype
-        # run, so recompute the field's element offset explicitly.
-        elem_off = off // torch.empty((), dtype=dtype).element_size()
-        if elem_off * torch.empty((), dtype=dtype).element_size() != off:
+        esz = torch.empty((), dtype=dtype).element_size()
+        if esz != 1 and esz != 2 and esz != 4:
+            raise ValueError(f"unsupported payload field dtype {dtype}")
+        if off % esz or lay.head_block_bytes % esz or self.head_stride_bytes % esz:
             raise ValueError(f"field {name} misaligned for {dtype}")
-        field_elems = lay.slot_bytes // torch.empty((), dtype=dtype).element_size()
-        field_stride_head = lay.head_block_bytes // torch.empty((), dtype=dtype).element_size()
-        field_stride_slot = lay.slot_bytes // torch.empty((), dtype=dtype).element_size()
-        # reshape bookkeeping: buffer as [slots, heads, head_block_bytes//esz]
-        head_fields = lay.head_block_bytes // torch.empty((), dtype=dtype).element_size()
-        base = flat.view(lay.slots, lay.heads, head_fields)
-        return base[:, :, elem_off : elem_off + field_numel].reshape(
-            lay.slots, lay.heads, *per_head_shape
+        if self.slot_stride_bytes % esz:
+            raise ValueError(f"payload slot stride misaligned for {dtype}")
+        # dtype reinterpret of the (possibly strided) pool view, then an
+        # explicit as_strided: per-head fields are dense inside the head
+        # block, slots and heads step by the pool's byte strides.
+        typed = self.buffer.view(dtype)
+        dense = torch.empty(per_head_shape).stride()
+        return torch.as_strided(
+            typed,
+            size=(lay.slots, lay.heads, *per_head_shape),
+            stride=(
+                self.slot_stride_bytes // esz,
+                self.head_stride_bytes // esz,
+                *dense,
+            ),
+            storage_offset=typed.storage_offset() + off // esz,
         )
 
     @property
@@ -245,3 +299,77 @@ class LeapQuantPayloadPool:
             dim=1,
         )
         return rows
+
+
+def leapquant_payload_state_extension(
+    state_shapes: tuple[tuple[int, ...], ...],
+) -> tuple[tuple[int, ...], torch.dtype] | None:
+    """Extra mamba state component carrying the payload pool, or ``None``.
+
+    Called from the attention layer's ``get_state_shape``/``get_state_dtype``
+    overrides: when ``leapquant_config.payload_pool`` is enabled, the mamba
+    spec grows a trailing ``(heads, head_block_bytes)`` uint8 state.  The
+    engine allocator (which slices one page into per-state views by
+    shape/dtype) then carves the payload pool out of the same page that
+    holds conv+ssm, giving it engine-sized slots and the state pool's exact
+    lifetime.  ``None`` (component omitted) keeps the page byte-identical
+    when LeapQuant is off.
+
+    ``state_shapes`` is the layer's *base* shape tuple; the temporal /
+    recurrent state is its last 3-D ``(heads, V, K)`` entry for both GDN
+    and KDA.
+    """
+    from vllm_ascend.quantization.methods.mamba_state.leapquant.runtime import (
+        leapquant_config_or_none,
+    )
+
+    config = leapquant_config_or_none()
+    if config is None or not config.payload_pool:
+        return None
+    temporal = state_shapes[-1]
+    if len(temporal) != 3:
+        raise ValueError(
+            "leapquant payload_pool: expected the last mamba state to be the "
+            f"(heads, V, K) temporal state, got shape {temporal}"
+        )
+    heads, v_dim, k_dim = temporal
+    try:
+        layout = PayloadLayout(1, heads, v_dim, k_dim, config.compensator_tokens)
+    except ValueError as e:
+        raise ValueError(
+            "leapquant payload_pool does not support this model's mamba state "
+            f"geometry (heads={heads}, V={v_dim}, K={k_dim}): {e}"
+        ) from e
+    return (heads, layout.head_block_bytes), torch.uint8
+
+
+def leapquant_payload_pool_for_layer(
+    layer: Any,
+    caches: Any,
+    state: torch.Tensor,
+    config: "LeapQuantConfig",
+) -> LeapQuantPayloadPool:
+    """Wrap the payload component of a bound mamba kv-cache (cached on the layer).
+
+    ``caches`` is the layer's bound ``kv_cache`` list whose trailing element
+    is the engine-carved uint8 payload view; ``state`` is the fp32 temporal
+    pool whose geometry the payload must match.  The wrapper is rebuilt only
+    when the underlying allocation changes (rebind), not per decode step.
+    """
+    if len(caches) <= 2:
+        raise RuntimeError(
+            "leapquant payload_pool is enabled but the bound kv cache has no "
+            "payload component; get_state_shape()/get_state_dtype() must append "
+            "the payload state when payload_pool is set"
+        )
+    view = caches[2]
+    heads, v_dim, k_dim = state.shape[-3], state.shape[-2], state.shape[-1]
+    key = (view.data_ptr(), tuple(view.shape), v_dim, k_dim, config.compensator_tokens)
+    cached = getattr(layer, "_leapquant_payload_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    pool = LeapQuantPayloadPool(
+        view, PayloadLayout(view.shape[0], heads, v_dim, k_dim, config.compensator_tokens)
+    )
+    layer._leapquant_payload_cache = (key, pool)
+    return pool
