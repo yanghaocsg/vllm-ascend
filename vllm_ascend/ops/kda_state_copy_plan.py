@@ -372,7 +372,10 @@ def initialize_kda_state_copy(static_forward_context: dict, max_selected: int) -
     plan_type: type[KDAStateCopyPlan] | type[StridedKDAFallbackPlan]
     for _, layer in bindings:
         kv_cache = getattr(layer, "kv_cache", None)
-        if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) != 2:
+        # LeapQuant payload_pool (M3.2b) appends a trailing uint8 payload
+        # component to the bound kv cache; the plan only touches the
+        # recurrent state, so accept the extended layout too.
+        if not isinstance(kv_cache, (tuple, list)) or len(kv_cache) < 2:
             raise RuntimeError("Kimi KDA cache must be bound before strict state-copy preparation")
         state = kv_cache[1]
         if not isinstance(state, torch.Tensor):

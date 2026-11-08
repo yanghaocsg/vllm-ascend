@@ -769,13 +769,18 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 if leapquant_config.payload_pool
                 else None
             )
+            # The payload checkpoint requires the fused triton flush, which
+            # indexes the strided [slots, H, V, K] pool directly (the same
+            # kernel the GDN path runs); bypass the gather/scatter plan for
+            # the flush only — prefill keeps using it.
+            use_state_copy = not leapquant_config.payload_pool
             leapquant_flush_state_rows(
                 recurrent_state,
                 attn_metadata.non_spec_state_indices_tensor,
                 leapquant_seq_lens,
                 config=leapquant_config,
                 state_copy=getattr(self, "_ascend_kda_state_copy", None)
-                if getattr(self, "_kda_state_copy_ready", False)
+                if use_state_copy and getattr(self, "_kda_state_copy_ready", False)
                 else None,
                 payload=payload,
             )
