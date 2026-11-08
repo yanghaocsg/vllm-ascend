@@ -83,6 +83,7 @@ def leapquant_flush_state_rows(
     *,
     config: LeapQuantConfig,
     state_copy: Any | None = None,
+    payload: Any | None = None,
 ) -> None:
     """Re-quantize the state rows whose sequence just crossed a window boundary.
 
@@ -90,8 +91,7 @@ def leapquant_flush_state_rows(
     tokens processed *after* this step's query, so the window-boundary
     condition is simply ``seq_len % window == 0`` for both decode and prefill
     rows.  The flush runs once per step, only on due rows, and leaves the
-    pool layout intact (fp32 in, fp32 out — the storage-side checkpoint lands
-    with the fused-kernel milestone).
+    pool layout intact (fp32 in, fp32 out) unless ``payload`` is supplied.
 
     Prefill caveat: a chunked-prefill chunk that *crosses* a window boundary
     without ending on it is not flushed at that interior boundary — the
@@ -112,6 +112,13 @@ def leapquant_flush_state_rows(
             expose ``gather(state, indices, flags)`` and
             ``scatter(state, source, indices)``. Falls back to plain indexing
             on CPU and to the GDN triton kernels on NPU.
+        payload: optional ``LeapQuantPayloadPool`` (requires
+            ``config.payload_pool`` + the triton backend).  The flush then
+            also persists the int8 checkpoint per due (slot, head).  The fp32
+            pool is rewritten as well (dual-write): the decode side keeps
+            reading fp32 until the payload readout milestone, so the pool
+            must stay correct.  ``hcnt`` rows are stored as 0 (empty new
+            window; the readout kernel advances the counter).
     """
     total = state_indices.shape[0]
     if total == 0:
@@ -139,8 +146,21 @@ def leapquant_flush_state_rows(
     ):
         from vllm_ascend.ops.triton.leapquant import leapquant_flush_triton
 
-        leapquant_flush_triton(state, slot_ids, compensator_tokens=config.compensator_tokens)
+        leapquant_flush_triton(
+            state,
+            slot_ids,
+            compensator_tokens=config.compensator_tokens,
+            **({"payload": payload, "rewrite_state": True} if payload is not None else {}),
+        )
         return
+
+    if payload is not None:
+        # Never silently drop the checkpoint: a payload pool consumer that
+        # reads stale/unwritten rows is a correctness bug, not a slowdown.
+        raise RuntimeError(
+            "leapquant payload_pool requires the fused triton flush (kernel_backend='triton', "
+            "NPU state pool with power-of-two head dims, no KDA gather/scatter plan)"
+        )
 
     flushed = None
     if state_copy is not None and state.device.type != "cpu":

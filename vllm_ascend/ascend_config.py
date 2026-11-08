@@ -311,6 +311,13 @@ class LeapQuantConfig:
     # for state pools with non-power-of-two head dims, and on the KDA
     # gather/scatter plan until the KDA flush variant lands.
     kernel_backend: Literal["torch", "triton"] = "torch"
+    # Persist flush checkpoints into the payload pool (int8 codes + fp32
+    # scales + fp16 compensator planes, ~1.19 B/elem vs 4 B fp32) instead
+    # of only round-tripping the fp32 pool in place. Requires
+    # kernel_backend="triton" (the fused kernel is the only encoder). The
+    # fp32 pool is still written (dual-write) until the payload readout
+    # milestone switches the decode side to read the checkpoint.
+    payload_pool: bool = False
 
     @model_validator(mode="after")
     def _validate(self):
@@ -327,13 +334,18 @@ class LeapQuantConfig:
                 "leapquant_config.kernel_backend='triton' supports compensator_tokens <= 16; "
                 f"got {self.compensator_tokens}"
             )
+        if self.payload_pool and self.kernel_backend != "triton":
+            raise ValueError(
+                "leapquant_config.payload_pool requires kernel_backend='triton' "
+                "(the fused kernel is the only checkpoint encoder)"
+            )
         return self
 
     @property
     def summary(self) -> str:
         return (
             f"LeapQuant enabled: window={self.window}, compensator_tokens={self.compensator_tokens}, "
-            f"bits={self.bits}, kernel_backend={self.kernel_backend}"
+            f"bits={self.bits}, kernel_backend={self.kernel_backend}, payload_pool={self.payload_pool}"
         )
 
 

@@ -17,6 +17,7 @@ Run on an Atlas A3 NPU (directory suffix routes to a3_2 CI runners).
 """
 
 import unittest
+from unittest.mock import MagicMock
 
 import torch
 
@@ -205,6 +206,80 @@ class TestLeapQuantPayload(unittest.TestCase):
         with self.assertRaises(ValueError):
             leapquant_flush_triton(pool, slot_ids, compensator_tokens=4, rewrite_state=True)
         self.assertTrue(torch.equal(pool, pool))  # pool untouched by failures
+
+
+class TestLeapQuantRuntimePayload(unittest.TestCase):
+    """End-to-end flush-hook wiring: config gate -> runtime -> kernel."""
+
+    def test_runtime_payload_dual_write(self):
+        from vllm_ascend.ascend_config import LeapQuantConfig
+        from vllm_ascend.quantization.methods.mamba_state.leapquant import (
+            leapquant_flush_state_rows,
+        )
+
+        torch.manual_seed(13)
+        pool = torch.randn(8, 4, 128, 128, device=DEVICE, dtype=torch.float32)
+        indices = torch.tensor([1, 4, 6], device=DEVICE, dtype=torch.int64)
+        seq_lens = torch.tensor([32, 33, 16])  # rows 0 and 2 due -> slots 1 and 6
+        cfg = LeapQuantConfig(
+            enabled=True,
+            window=16,
+            compensator_tokens=4,
+            kernel_backend="triton",
+            payload_pool=True,
+        )
+        pl = LeapQuantPayloadPool.allocate(8, 4, 128, 128, 4, device=pool.device)
+
+        torch.manual_seed(1234)
+        reference = _reference_flush(pool, indices[[0, 2]], 4)
+        leapquant_flush_state_rows(pool, indices, seq_lens, config=cfg, payload=pl)
+        torch.npu.synchronize()
+
+        # fp32 pool: due rows flushed (dual-write keeps decode-side readers
+        # correct), non-due rows bit-untouched.
+        step = _code_step_bound(pool, indices[[0, 2]], 4)
+        scale = pool[[1, 6]].abs().mean().item() + 1.0
+        max_abs = (pool[[1, 6]] - reference[[1, 6]]).abs().max().item()
+        self.assertLess(max_abs, 2.0 * step + 1e-5 * scale)
+        self.assertTrue(torch.equal(pool[4], reference[4]))
+
+        # payload: due rows checkpointed, non-due rows bit-zero, hcnt = 0
+        self.assertTrue(torch.equal(pl.hcnt[[1, 6]].cpu(), torch.zeros(2, 4, dtype=torch.int32)))
+        spare = pl.buffer.reshape(pl.layout.slots, -1)[[0, 2, 3, 4, 5, 7]]
+        self.assertEqual(int(spare.int().abs().sum()), 0)
+        recon = pl.reconstruct_rows(torch.tensor([1, 6], device=DEVICE)).cpu()
+        max_recon = (recon - reference[[1, 6]].cpu()).abs().max().item()
+        self.assertLess(max_recon, 2.0 * step + 1e-5 * scale)
+
+    def test_runtime_payload_never_silently_dropped(self):
+        from vllm_ascend.ascend_config import LeapQuantConfig
+        from vllm_ascend.quantization.methods.mamba_state.leapquant import (
+            leapquant_flush_state_rows,
+        )
+
+        cfg = LeapQuantConfig(
+            enabled=True, window=16, compensator_tokens=4, kernel_backend="triton"
+        )
+        pool = torch.randn(4, 2, 128, 128, device=DEVICE, dtype=torch.float32)
+        pl = LeapQuantPayloadPool.allocate(4, 2, 128, 128, 4, device=pool.device)
+        # A KDA-style gather/scatter plan disables the fused path; the
+        # payload must then hard-fail instead of quietly skipping the write.
+        plan = MagicMock()
+        with self.assertRaises(RuntimeError):
+            leapquant_flush_state_rows(
+                pool,
+                torch.tensor([1], device=DEVICE),
+                torch.tensor([16]),
+                config=cfg,
+                state_copy=plan,
+                payload=pl,
+            )
+
+    def test_config_payload_pool_requires_triton(self):
+        from vllm_ascend.ascend_config import LeapQuantConfig
+
+        with self.assertRaises(ValueError):
+            LeapQuantConfig(enabled=True, payload_pool=True)
 
 
 if __name__ == "__main__":
