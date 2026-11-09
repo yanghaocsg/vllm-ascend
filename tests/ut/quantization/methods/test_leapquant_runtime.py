@@ -48,6 +48,21 @@ class TestLeapQuantRuntime(unittest.TestCase):
         untouched = [0, 1, 2, 4, 7]
         self.assertTrue(bool((pool[untouched] == before[untouched]).all()))
 
+    def test_query_lens_crossing_semantics(self):
+        # Chunk [10, 20) crosses window boundary 16 without ending on it:
+        # the legacy mask skips the row, the M3.3 crossing mask flushes it.
+        pool = torch.randn(6, 2, 16, 16)
+        indices = torch.tensor([1, 2])
+        seq_lens = torch.tensor([20, 24])
+        query_lens = torch.tensor([10, 4])
+        before = pool.clone()
+        leapquant_flush_state_rows(pool, indices, seq_lens, config=self.config)
+        self.assertFalse(bool((pool[1] != before[1]).any()))  # legacy: 20 % 16 != 0
+        pool = before.clone()
+        leapquant_flush_state_rows(pool, indices, seq_lens, config=self.config, query_lens=query_lens)
+        self.assertTrue(bool((pool[1] != before[1]).any()))  # M3.3: crossed 16
+        self.assertFalse(bool((pool[2] != before[2]).any()))  # [20, 24) inside window 2
+
     def test_no_due_rows_is_noop(self):
         pool = torch.randn(4, 2, 16, 16)
         before = pool.clone()

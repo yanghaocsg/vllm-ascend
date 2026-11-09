@@ -968,15 +968,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
-        # 2.4: LeapQuant window-boundary flush (RFC vllm-ascend#21097, M1).
-        # After this step's recurrent update / prefill scatter, re-quantize
-        # the state of every request whose post-step token count (== seq_len)
-        # is an exact multiple of the window. Within a window the state stays
-        # fp32, so quantization error enters only at boundaries — which is
-        # algebraically the paper's windowed formulation. No-op unless
-        # leapquant_config is enabled (and spec/PD/FULL-graph are rejected at
-        # config validation, so the CPU seq_lens attached by the metadata
-        # builder are exact here).
+        # 2.4: LeapQuant window-boundary flush (RFC vllm-ascend#21097, M1 +
+        # M3.3). After this step's recurrent update / prefill scatter,
+        # re-quantize the state of every request whose step span
+        # [seq_len - query_len, seq_len] crossed a window multiple (decode
+        # rows: seq_len % window == 0; a chunked-prefill chunk crossing an
+        # interior boundary is flushed at chunk end). Within a window the
+        # state stays fp32, so quantization error enters only at boundaries
+        # — which is algebraically the paper's windowed formulation. No-op
+        # unless leapquant_config is enabled (and spec/PD/FULL-graph are
+        # rejected at config validation, so the CPU seq_lens/query_lens
+        # attached by the metadata builder are exact here).
         leapquant_config = leapquant_config_or_none()
         if (
             leapquant_config is not None
@@ -993,6 +995,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 non_spec_state_indices_tensor,
                 leapquant_seq_lens,
                 config=leapquant_config,
+                query_lens=getattr(attn_metadata, "leapquant_query_lens", None),
                 payload=payload,
             )
 

@@ -48,6 +48,7 @@ __all__ = [
     "leap_window_flush",
     "decode_flush_mask",
     "prefill_flush_mask",
+    "crossed_boundary_mask",
 ]
 
 # Symmetric int8 quantization uses the [-127, 127] range (no -128), matching
@@ -199,3 +200,23 @@ def prefill_flush_mask(context_lens: torch.Tensor, query_lens: torch.Tensor, win
     """
     ends = context_lens.to(torch.long) + query_lens.to(torch.long)
     return (ends > 0) & (ends % window == 0)
+
+
+def crossed_boundary_mask(seq_lens: torch.Tensor, query_lens: torch.Tensor, window: int) -> torch.Tensor:
+    """Rows whose step crossed at least one window boundary (M3.3 semantics).
+
+    ``seq_lens`` are post-step token counts and ``query_lens`` the tokens
+    this step processed, so the step spanned ``[seq_len - query_len,
+    seq_len]``.  The row is due when that span crosses a window multiple —
+    for decode rows (``query_len == 1``) this reduces exactly to the
+    ``seq_len % window == 0`` condition, while a chunked-prefill chunk that
+    crosses an interior boundary without ending on it is due as well (the
+    M1 behavior of flushing only boundary-aligned chunk ends is what this
+    replaces).
+
+    ``seq_lens``/``query_lens`` are CPU int tensors aligned with the
+    flush-site state-index rows (decodes first, then prefills).
+    """
+    ends = seq_lens.to(torch.long)
+    starts = (ends - query_lens.to(torch.long)).clamp_min(0)
+    return (ends // window) > (starts // window)

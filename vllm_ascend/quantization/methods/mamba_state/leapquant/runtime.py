@@ -14,7 +14,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm_ascend.quantization.methods.mamba_state.leapquant.state import leap_window_flush
+from vllm_ascend.quantization.methods.mamba_state.leapquant.state import (
+    crossed_boundary_mask,
+    leap_window_flush,
+)
 
 if TYPE_CHECKING:
     from vllm_ascend.ascend_config import LeapQuantConfig
@@ -82,32 +85,35 @@ def leapquant_flush_state_rows(
     seq_lens: torch.Tensor,
     *,
     config: LeapQuantConfig,
+    query_lens: torch.Tensor | None = None,
     state_copy: Any | None = None,
     payload: Any | None = None,
 ) -> None:
-    """Re-quantize the state rows whose sequence just crossed a window boundary.
+    """Re-quantize the state rows whose step just crossed a window boundary.
 
-    The scheduler orders requests decodes-first, and ``seq_lens`` counts the
-    tokens processed *after* this step's query, so the window-boundary
-    condition is simply ``seq_len % window == 0`` for both decode and prefill
-    rows.  The flush runs once per step, only on due rows, and leaves the
-    pool layout intact (fp32 in, fp32 out) unless ``payload`` is supplied.
+    With ``query_lens`` (M3.3 semantics, what the GDN/KDA attention layers
+    pass), a row is due when its step span ``[seq_len - query_len, seq_len]``
+    crossed at least one window multiple — for decode rows this reduces
+    exactly to ``seq_len % window == 0``, and a chunked-prefill chunk that
+    crosses an interior boundary without ending on it is flushed too.  The
+    chunked delta-rule kernel only materializes the end-of-chunk state, so a
+    chunk crossing ``k >= 1`` boundaries gets exactly one flush, at chunk
+    end; no boundary is ever skipped across steps (each boundary sees its
+    flush at the first step end past it).  Without ``query_lens`` the legacy
+    ``seq_len % window == 0`` mask applies (decode-only callers, unit tests).
 
-    Prefill caveat: a chunked-prefill chunk that *crosses* a window boundary
-    without ending on it is not flushed at that interior boundary — the
-    chunked delta-rule kernel only materializes the end-of-chunk state.  In
-    that window the state accumulates one (or a few) extra tokens before the
-    next boundary-aligned flush, which can only *reduce* the injected
-    quantization error per boundary; the exact per-boundary cadence is
-    restored from the first decode boundary on.  Exact interior-boundary
-    flushes are deferred to the fused-kernel milestone, whose chunk loop can
-    emit per-window states.
+    In payload mode the per-row window phase is persisted: ``hcnt`` stores
+    ``seq_len % window`` (0 at an exact boundary, the in-window offset of a
+    mid-window chunk-end flush) so the payload readout knows how many tokens
+    the checkpoint folds in.
 
     Args:
         state: state pool ``[slots, H, V, K]`` (may have a padded batch stride).
         state_indices: per-request state slot ids aligned with ``seq_lens``.
         seq_lens: CPU int tensor of per-request post-step sequence lengths.
         config: enabled LeapQuantConfig.
+        query_lens: CPU int tensor of per-request query lengths aligned with
+            ``seq_lens``; enables the crossing-based due mask (see above).
         state_copy: optional layer-owned gather/scatter plan (KDA); must
             expose ``gather(state, indices, flags)`` and
             ``scatter(state, source, indices)``. Falls back to plain indexing
@@ -117,14 +123,17 @@ def leapquant_flush_state_rows(
             also persists the int8 checkpoint per due (slot, head).  The fp32
             pool is rewritten as well (dual-write): the decode side keeps
             reading fp32 until the payload readout milestone, so the pool
-            must stay correct.  ``hcnt`` rows are stored as 0 (empty new
-            window; the readout kernel advances the counter).
+            must stay correct.
     """
     total = state_indices.shape[0]
     if total == 0:
         return
     _check_device_once()
-    due = (seq_lens[:total].to(torch.long) % config.window) == 0
+    seq_lens = seq_lens[:total]
+    if query_lens is not None:
+        due = crossed_boundary_mask(seq_lens, query_lens[:total], config.window)
+    else:
+        due = (seq_lens.to(torch.long) % config.window) == 0
     due_rows = torch.nonzero(due, as_tuple=False).flatten()
     if due_rows.numel() == 0:
         return
@@ -146,11 +155,22 @@ def leapquant_flush_state_rows(
     ):
         from vllm_ascend.ops.triton.leapquant import leapquant_flush_triton
 
+        extra: dict[str, Any] = {}
+        if payload is not None:
+            # M3.3: persist the window phase per due row — 0 at an exact
+            # boundary, the in-window offset of a mid-window chunk-end flush
+            # (the kernel wrapper's scalar hcnt_value default would lose it).
+            phase = (seq_lens.to(torch.long)[due_rows] % config.window).to(torch.int32)
+            extra = {
+                "payload": payload,
+                "rewrite_state": True,
+                "hcnt_values": phase.to(state.device),
+            }
         leapquant_flush_triton(
             state,
             slot_ids,
             compensator_tokens=config.compensator_tokens,
-            **({"payload": payload, "rewrite_state": True} if payload is not None else {}),
+            **extra,
         )
         return
 

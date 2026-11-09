@@ -1084,14 +1084,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         num_decodes: int,
         num_prefills: int,
     ) -> None:
-        """Attach per-request post-step sequence lengths for LeapQuant (M1).
+        """Attach per-request step geometry for LeapQuant (M1 + M3.3).
 
-        The GDN layer reads this CPU tensor after its recurrent update and
-        re-quantizes the state of every request whose sequence length is an
-        exact multiple of the LeapQuant window (the post-step token count of
-        a request *is* its seq_len, decode or prefill alike). Speculative
-        decoding and FULL cudagraphs are rejected at config validation, so
-        the CPU upper bound on seq_lens is exact for every row here.
+        The GDN layer reads these CPU tensors after its recurrent update and
+        re-quantizes the state of every request whose step span
+        ``[seq_len - query_len, seq_len]`` crossed a window multiple (M3.3
+        crossing semantics; reduces to ``seq_len % window == 0`` for decode).
+        Speculative decoding and FULL cudagraphs are rejected at config
+        validation, so the CPU upper bound on seq_lens is exact for every
+        row here.
         """
         from vllm_ascend.quantization.methods.mamba_state.leapquant import leapquant_config_or_none
 
@@ -1103,7 +1104,17 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # Skip full-graph padding rows: leapquant rejects FULL cudagraph, so
         # this slice is exactly the real decodes-then-prefills request rows
         # that non_spec_state_indices_tensor addresses.
-        attn_metadata.leapquant_seq_lens = seq_lens_cpu[: num_decodes + num_prefills].to(torch.int64)
+        rows = num_decodes + num_prefills
+        attn_metadata.leapquant_seq_lens = seq_lens_cpu[:rows].to(torch.int64)
+        query_start_loc_cpu = getattr(m, "query_start_loc_cpu", None)
+        if query_start_loc_cpu is not None and query_start_loc_cpu.numel() >= rows + 1:
+            # Per-request query lens (M3.3): diff of the cumulative token
+            # starts, same precedent the builder uses for query_lens.
+            # Defensive getattr: without it the flush falls back to the M1
+            # boundary-aligned mask (decode-equivalent either way).
+            attn_metadata.leapquant_query_lens = (
+                torch.diff(query_start_loc_cpu)[:rows].to(torch.int64)
+            )
 
 
 class AscendGDNAttentionBackend(GDNAttentionBackend):

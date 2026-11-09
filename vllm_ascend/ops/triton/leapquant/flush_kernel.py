@@ -264,7 +264,7 @@ def _leapquant_payload_encode_kernel(
     u_ptr,  # fp16 [slots, H, R, K] payload key-side factors (out)
     q_ptr,  # fp16 [slots, H, R, V] payload value-side factors (out)
     hcnt_ptr,  # int32 [slots, H] window fill counters (out)
-    hcnt_val,  # int32 scalar written to every due (slot, head)
+    hcnt_vals_ptr,  # int32 [D] per-due-row window fill counter (M3.3: mid-window flush phase)
     qv_ptr,  # fp16 [D*H, V, 16] fp16-rounded value-side factors (scratch)
     uk_ptr,  # fp16 [D*H, K, 16] fp16-rounded key-side coefficients (scratch)
     sk_s_ptr,  # fp32 [D*H, K] residual scales (scratch)
@@ -345,7 +345,7 @@ def _leapquant_payload_encode_kernel(
              uk_f.to(u_ptr.dtype.element_ty), mask=offs_r[None, :] < R)
     tl.store(q_ptr + slot * pl_sb_f16 + h * pl_hb_f16 + offs_v[:, None] * R + offs_r[None, :],
              qv_f.to(q_ptr.dtype.element_ty), mask=offs_r[None, :] < R)
-    tl.store(hcnt_ptr + slot * pl_sb_f32 + h * pl_hb_f32, hcnt_val.to(tl.int32))
+    tl.store(hcnt_ptr + slot * pl_sb_f32 + h * pl_hb_f32, tl.load(hcnt_vals_ptr + d))
 
 
 def _get_q0(v_dim: int, rank: int, device: torch.device) -> torch.Tensor:
@@ -365,6 +365,7 @@ def leapquant_flush_triton(
     payload=None,  # LeapQuantPayloadPool (duck-typed; avoids an import cycle)
     rewrite_state: bool | None = None,
     hcnt_value: int = 0,
+    hcnt_values: torch.Tensor | None = None,
 ) -> None:
     """Fused LeapQuant flush of ``slot_ids`` rows of a state pool.
 
@@ -393,7 +394,14 @@ def leapquant_flush_triton(
             ``state`` and ``compensator_tokens``.
         rewrite_state: payload-mode fp32 rewrite flag (see above); must
             be None in roundtrip mode.
-        hcnt_value: window fill counter stored for every due (slot, head).
+        hcnt_value: window fill counter stored for every due (slot, head);
+            used when ``hcnt_values`` is None.
+        hcnt_values: per-due-row window fill counters (M3.3).  A flush at
+            an exact boundary stores 0 (fresh window); a chunked-prefill
+            flush landing mid-window stores ``seq_len % window`` so the
+            payload readout knows the checkpoint's window phase.  int32,
+            ``[len(slot_ids)]``, on ``state.device``; overrides
+            ``hcnt_value``.
     """
     if state.ndim != 4:
         raise ValueError(f"state must be [slots, H, V, K], got ndim={state.ndim}")
@@ -430,6 +438,16 @@ def leapquant_flush_triton(
         rewrite_state = False  # pure payload mode: leave the fp32 pool alone
 
     due = slot_ids.to(torch.int64) if slot_ids.dtype != torch.int64 else slot_ids
+    if hcnt_values is None:
+        hcnt_vals_t = torch.full(
+            (due.numel(),), hcnt_value, dtype=torch.int32, device=state.device
+        )
+    else:
+        if hcnt_values.dtype != torch.int32 or hcnt_values.device != state.device:
+            raise ValueError("hcnt_values must be an int32 tensor on state.device")
+        if hcnt_values.shape != due.shape:
+            raise ValueError(f"hcnt_values shape {tuple(hcnt_values.shape)} != slot_ids {tuple(due.shape)}")
+        hcnt_vals_t = hcnt_values
     q0 = _get_q0(v_dim, compensator_tokens, state.device)
     blocks = due.numel() * heads
     qk_s = torch.empty((blocks, k_dim, 16), dtype=torch.float32, device=state.device)
@@ -499,7 +517,7 @@ def leapquant_flush_triton(
         payload.u,
         payload.q,
         payload.hcnt,
-        hcnt_value,
+        hcnt_vals_t,
         qv_s,
         uk_s,
         sk,

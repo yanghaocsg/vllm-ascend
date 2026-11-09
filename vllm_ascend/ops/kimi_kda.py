@@ -779,6 +779,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 attn_metadata.non_spec_state_indices_tensor,
                 leapquant_seq_lens,
                 config=leapquant_config,
+                query_lens=getattr(attn_metadata, "leapquant_query_lens", None),
                 state_copy=getattr(self, "_ascend_kda_state_copy", None)
                 if use_state_copy and getattr(self, "_kda_state_copy_ready", False)
                 else None,

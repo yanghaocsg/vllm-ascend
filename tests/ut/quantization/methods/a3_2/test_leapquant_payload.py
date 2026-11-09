@@ -137,6 +137,40 @@ class TestLeapQuantPayload(unittest.TestCase):
         rows = slot_ids.to(torch.int64)
         self.assertTrue(torch.equal(pl.hcnt[rows].cpu(), torch.full((3, 4), 16, dtype=torch.int32)))
 
+    def test_payload_per_row_hcnt(self):
+        """M3.3: hcnt stores the per-row window phase (seq % window), not a
+        pool-wide scalar — a boundary-aligned row stores 0, mid-window
+        chunk-end flushes store their in-window offset."""
+        torch.manual_seed(12)
+        pool = torch.randn(5, 2, 128, 128, device=DEVICE, dtype=torch.float32)
+        slot_ids = torch.tensor([0, 2, 4], device=DEVICE, dtype=torch.int64)
+        pl = LeapQuantPayloadPool.allocate(5, 2, 128, 128, 4, device=DEVICE)
+        # window 16: flush at seq=16 -> phase 0; seq=20 -> phase 4; seq=31 -> 15
+        phases = torch.tensor([0, 4, 15], dtype=torch.int32, device=DEVICE)
+        leapquant_flush_triton(
+            pool, slot_ids, compensator_tokens=4, payload=pl, hcnt_values=phases
+        )
+        torch.npu.synchronize()
+        rows = slot_ids.to(torch.int64)
+        self.assertTrue(
+            torch.equal(pl.hcnt[rows].cpu(), phases.view(3, 1).expand(3, 2).cpu())
+        )
+        # non-due rows keep their zero-initialized hcnt
+        self.assertTrue(
+            torch.equal(pl.hcnt[[1, 3]].cpu(), torch.zeros(2, 2, dtype=torch.int32))
+        )
+        # validation: hcnt_values must be int32 on state.device, shape == slot_ids
+        with self.assertRaises(ValueError):
+            leapquant_flush_triton(
+                pool, slot_ids, compensator_tokens=4, payload=pl,
+                hcnt_values=phases.to(torch.int64),
+            )
+        with self.assertRaises(ValueError):
+            leapquant_flush_triton(
+                pool, slot_ids, compensator_tokens=4, payload=pl,
+                hcnt_values=phases[:2],
+            )
+
     def test_payload_kda_geometry(self):
         """KDA pool geometry [slots, H, V, K] with H=8, V=K=128."""
         torch.manual_seed(10)

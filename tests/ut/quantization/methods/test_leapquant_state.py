@@ -15,6 +15,7 @@ import unittest
 import torch
 
 from vllm_ascend.quantization.methods.mamba_state.leapquant import (
+    crossed_boundary_mask,
     decode_flush_mask,
     fit_compensators,
     leap_window_flush,
@@ -115,6 +116,40 @@ class TestLeapQuantState(unittest.TestCase):
         # with (context, query) has seq_len = context + query after the step.
         for c, q in zip(ctx.tolist(), query.tolist()):
             self.assertEqual((c + q) % 16 == 0, prefill_flush_mask(torch.tensor([c]), torch.tensor([q]), 16).item())
+
+    def test_crossed_boundary_mask(self):
+        w = 16
+        # decode equivalence: query_len == 1 reduces exactly to seq % w == 0.
+        # (seq=0 — an empty sequence, no state to flush — is excluded, same
+        # as the `ends > 0` guard in decode_flush_mask.)
+        seqs = torch.arange(1, 70)
+        ones = torch.ones_like(seqs)
+        self.assertTrue(torch.equal(crossed_boundary_mask(seqs, ones, w), seqs % w == 0))
+        # interior crossing (the M1 gap): chunk [10, 20) crosses boundary 16
+        # without ending on it -> due under M3.3, missed by seq % w == 0
+        self.assertTrue(crossed_boundary_mask(torch.tensor([20]), torch.tensor([10]), w).item())
+        self.assertNotEqual(20 % w, 0)
+        # multi-boundary chunk [5, 50) crosses 16/32/48 -> due (one flush)
+        self.assertTrue(crossed_boundary_mask(torch.tensor([50]), torch.tensor([45]), w).item())
+        # no crossing: [20, 30) lives inside window 2
+        self.assertFalse(crossed_boundary_mask(torch.tensor([30]), torch.tensor([10]), w).item())
+        # boundary-aligned chunk end [8, 32) still due
+        self.assertTrue(crossed_boundary_mask(torch.tensor([32]), torch.tensor([24]), w).item())
+        # degenerate query > seq clamps the start to 0 (defensive only)
+        self.assertFalse(crossed_boundary_mask(torch.tensor([5]), torch.tensor([10]), w).item())
+        # no boundary is ever skipped: walking [0, 100) in steps of 7 flushes
+        # exactly once per crossed boundary (16, 32, 48, 64, 80, 96)
+        seq, q = 100, 7
+        due_ends = [
+            min(s + q, seq)
+            for s in range(0, seq, q)
+            if crossed_boundary_mask(
+                torch.tensor([min(s + q, seq)]),
+                torch.tensor([q if s + q <= seq else seq - s]),
+                w,
+            ).item()
+        ]
+        self.assertEqual(due_ends, [21, 35, 49, 70, 84, 98])
 
 
 if __name__ == "__main__":

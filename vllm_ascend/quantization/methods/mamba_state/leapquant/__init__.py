@@ -18,6 +18,7 @@ from vllm_ascend.quantization.methods.mamba_state.leapquant.runtime import (
     leapquant_flush_state_rows,
 )
 from vllm_ascend.quantization.methods.mamba_state.leapquant.state import (
+    crossed_boundary_mask,
     decode_flush_mask,
     fit_compensators,
     leap_window_flush,
@@ -31,6 +32,7 @@ from vllm_ascend.quantization.methods.mamba_state.leapquant.state import (
 __all__ = [
     "LeapQuantPayloadPool",
     "PayloadLayout",
+    "crossed_boundary_mask",
     "decode_flush_mask",
     "fit_compensators",
     "leap_window_flush",
