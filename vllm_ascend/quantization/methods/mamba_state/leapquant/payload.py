@@ -343,6 +343,50 @@ def leapquant_payload_state_extension(
     return (heads, layout.head_block_bytes), torch.uint8
 
 
+def leapquant_extend_model_state_classmethods(model_cls: type) -> None:
+    """Extend a model class's config-time mamba state classmethods.
+
+    The platform sizes the shared hybrid page *before* any worker exists:
+    ``Platform.update_block_size_for_backend`` ->
+    ``_align_hybrid_block_size`` builds ``mamba_page_size`` from
+    ``model_cls.get_mamba_state_shape_from_config`` /
+    ``get_mamba_state_dtype_from_config`` and then pins
+    ``cache_config.mamba_page_size_padded`` to the attention page covering
+    it.  Those classmethods know only conv+ssm, so with ``payload_pool`` on
+    the real (instance-level) spec grew past the pinned pad and
+    ``MambaSpec.page_size_bytes`` asserts ``page_size_padded >= page_size``
+    at worker startup.  Wrapping the classmethods to append the same
+    trailing ``(heads, head_block_bytes)`` uint8 state makes the config-time
+    math see the true page.  Disabled (or no AscendConfig yet) -> the
+    original classmethods are kept, byte-identical behavior.
+
+    Idempotent; a per-class marker makes repeated application a no-op (a
+    subclass that defines its own classmethods is not skipped, because the
+    marker is only read from the class ``__dict__``).
+    """
+    if "_leapquant_state_extended" in model_cls.__dict__:
+        return
+    orig_shape = model_cls.get_mamba_state_shape_from_config
+    orig_dtype = model_cls.get_mamba_state_dtype_from_config
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):  # type: ignore[no-redef]
+        shapes = tuple(orig_shape(vllm_config))
+        ext = leapquant_payload_state_extension(shapes)
+        return shapes if ext is None else (*shapes, ext[0])
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):  # type: ignore[no-redef]
+        shapes = tuple(orig_shape(vllm_config))
+        dtypes = tuple(orig_dtype(vllm_config))
+        ext = leapquant_payload_state_extension(shapes)
+        return dtypes if ext is None else (*dtypes, ext[1])
+
+    model_cls.get_mamba_state_shape_from_config = get_mamba_state_shape_from_config
+    model_cls.get_mamba_state_dtype_from_config = get_mamba_state_dtype_from_config
+    model_cls._leapquant_state_extended = True
+
+
 def leapquant_payload_pool_for_layer(
     layer: Any,
     caches: Any,

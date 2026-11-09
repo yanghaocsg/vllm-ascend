@@ -23,7 +23,11 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention as _GDNBaseCls
-from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.models.qwen3_5 import (
+    Qwen3_5DecoderLayer,
+    Qwen3_5ForCausalLMBase,
+    Qwen3_5ForConditionalGeneration,
+)
 
 try:
     from vllm.model_executor.models.qwen3_5_mtp import Qwen3_5MultiTokenPredictor
@@ -210,6 +214,20 @@ _GDN_PATCH_TARGET.get_attn_backend = AscendGatedDeltaNetAttention.get_attn_backe
 # optional payload state component too (the 310p branch below installs its
 # own and stays untouched — LeapQuant is A3-only).
 _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention.get_state_dtype
+
+# LeapQuant payload pool (M3.2b), config-time side: the platform sizes the
+# shared hybrid page from the MODEL classmethods
+# (get_mamba_state_{shape,dtype}_from_config) before any worker exists and
+# pins cache_config.mamba_page_size_padded to it; without the payload state
+# there, a payload_pool spec trips MambaSpec.page_size_bytes' assert at
+# worker startup. Qwen3_5ForCausalLMBase covers the dense + MoE CausalLM
+# classes; the VL ForConditionalGeneration defines its own copies.
+from vllm_ascend.quantization.methods.mamba_state.leapquant.payload import (
+    leapquant_extend_model_state_classmethods,
+)
+
+leapquant_extend_model_state_classmethods(Qwen3_5ForCausalLMBase)
+leapquant_extend_model_state_classmethods(Qwen3_5ForConditionalGeneration)
 
 if get_current_hardware_profile().supports(HardwareCapability.GDN_COMPATIBILITY):
     from vllm_ascend._310p.ops.fla.gdn_310 import AscendGatedDeltaNetAttention310

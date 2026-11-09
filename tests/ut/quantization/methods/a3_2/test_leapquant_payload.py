@@ -323,6 +323,97 @@ class TestLeapQuantEnginePool(unittest.TestCase):
                 ext(((512, 4), (8, 96, 128)))
 
 
+class TestLeapQuantModelClassmethodExtension(unittest.TestCase):
+    """Config-time classmethod wrap feeding the platform's page sizing."""
+
+    def test_wrap_appends_payload_state(self):
+        import types
+        from unittest.mock import patch
+
+        from vllm_ascend.ascend_config import LeapQuantConfig
+        from vllm_ascend.quantization.methods.mamba_state.leapquant import (
+            leapquant_extend_model_state_classmethods as wrap,
+        )
+
+        class FakeModel:
+            @classmethod
+            def get_mamba_state_shape_from_config(cls, vllm_config):
+                return ((512, 4), (8, 128, 128))
+
+            @classmethod
+            def get_mamba_state_dtype_from_config(cls, vllm_config):
+                return (torch.bfloat16, torch.float32)
+
+        wrap(FakeModel)
+        # engine off (no AscendConfig singleton in UT) -> byte-identical passthrough
+        self.assertEqual(
+            FakeModel.get_mamba_state_shape_from_config(None), ((512, 4), (8, 128, 128))
+        )
+        self.assertEqual(
+            FakeModel.get_mamba_state_dtype_from_config(None), (torch.bfloat16, torch.float32)
+        )
+
+        cfg = LeapQuantConfig(
+            enabled=True, window=16, compensator_tokens=4, kernel_backend="triton", payload_pool=True
+        )
+        fake = types.SimpleNamespace(leapquant_config=cfg)
+        with patch("vllm_ascend.ascend_config.get_ascend_config", return_value=fake):
+            shapes = FakeModel.get_mamba_state_shape_from_config(None)
+            dtypes = FakeModel.get_mamba_state_dtype_from_config(None)
+        hbb = PayloadLayout(1, 8, 128, 128, 4).head_block_bytes
+        self.assertEqual(shapes, ((512, 4), (8, 128, 128), (8, hbb)))
+        self.assertEqual(dtypes, (torch.bfloat16, torch.float32, torch.uint8))
+
+        # idempotent: the class-dict marker makes a second wrap a no-op
+        wrap(FakeModel)
+        with patch("vllm_ascend.ascend_config.get_ascend_config", return_value=fake):
+            self.assertEqual(
+                FakeModel.get_mamba_state_shape_from_config(None),
+                ((512, 4), (8, 128, 128), (8, hbb)),
+            )
+
+    def test_wrap_subclass_with_own_classmethods(self):
+        """A subclass defining its own classmethods must still get wrapped."""
+        import types
+        from unittest.mock import patch
+
+        from vllm_ascend.ascend_config import LeapQuantConfig
+        from vllm_ascend.quantization.methods.mamba_state.leapquant import (
+            leapquant_extend_model_state_classmethods as wrap,
+        )
+
+        class FakeBase:
+            @classmethod
+            def get_mamba_state_shape_from_config(cls, vllm_config):
+                return ((512, 4), (8, 128, 128))
+
+            @classmethod
+            def get_mamba_state_dtype_from_config(cls, vllm_config):
+                return (torch.bfloat16, torch.float32)
+
+        class FakeSub(FakeBase):
+            @classmethod
+            def get_mamba_state_shape_from_config(cls, vllm_config):
+                return ((256, 4), (4, 64, 64))
+
+            @classmethod
+            def get_mamba_state_dtype_from_config(cls, vllm_config):
+                return (torch.bfloat16, torch.float32)
+
+        wrap(FakeBase)
+        wrap(FakeSub)  # marker lives only in FakeBase.__dict__, FakeSub must wrap its own
+        cfg = LeapQuantConfig(
+            enabled=True, window=16, compensator_tokens=4, kernel_backend="triton", payload_pool=True
+        )
+        fake = types.SimpleNamespace(leapquant_config=cfg)
+        with patch("vllm_ascend.ascend_config.get_ascend_config", return_value=fake):
+            shapes = FakeSub.get_mamba_state_shape_from_config(None)
+            dtypes = FakeSub.get_mamba_state_dtype_from_config(None)
+        hbb = PayloadLayout(1, 4, 64, 64, 4).head_block_bytes
+        self.assertEqual(shapes, ((256, 4), (4, 64, 64), (4, hbb)))
+        self.assertEqual(dtypes, (torch.bfloat16, torch.float32, torch.uint8))
+
+
 class TestLeapQuantRuntimePayload(unittest.TestCase):
     """End-to-end flush-hook wiring: config gate -> runtime -> kernel."""
 

@@ -9,6 +9,7 @@ the algorithm reference and RFC vllm-ascend#21097 for the rollout plan.
 from vllm_ascend.quantization.methods.mamba_state.leapquant.payload import (
     LeapQuantPayloadPool,
     PayloadLayout,
+    leapquant_extend_model_state_classmethods,
     leapquant_payload_pool_for_layer,
     leapquant_payload_state_extension,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "leap_window_flush",
     "leapquant_config_or_none",
     "leapquant_flush_state_rows",
+    "leapquant_extend_model_state_classmethods",
     "leapquant_payload_pool_for_layer",
     "leapquant_payload_state_extension",
     "mgs_orthonormal_columns",

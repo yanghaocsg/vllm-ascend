@@ -90,6 +90,9 @@ from vllm_ascend.attention.utils import mark_fused_preprocess_weights
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.ops.kimi_kda import AscendKimiK3DeltaAttention  # type: ignore[import-untyped]
 from vllm_ascend.ops.linear_op import KimiOProjMMReduceScatterOp
+from vllm_ascend.quantization.methods.mamba_state.leapquant.payload import (
+    leapquant_extend_model_state_classmethods,
+)
 from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8DynamicLinearMethod
 from vllm_ascend.utils import get_rotation_path, is_950, vllm_version_is
 from vllm_ascend.worker.v2.pp_transport import (
@@ -1294,3 +1297,14 @@ class AscendKimiK3ForConditionalGeneration(UpstreamKimiK3ForConditionalGeneratio
 
     def set_dspark_aux_capture_materialized(self, enabled: bool) -> None:
         self.language_model.set_dspark_aux_capture_materialized(enabled)
+
+
+# LeapQuant payload pool (M3.2b), config-time side: keep the model-class
+# mamba state classmethods in sync with the instance-level payload state
+# extension (see ops/kimi_kda.py), so the platform's hybrid page sizing sees
+# the true page instead of pinning a too-small cache_config.
+# mamba_page_size_padded. Both classes are wrapped: the upstream K3
+# classmethods delegate straight to the upstream KimiLinear class, so
+# wrapping AscendKimiLinearForCausalLM alone would not cover K3.
+leapquant_extend_model_state_classmethods(AscendKimiLinearForCausalLM)
+leapquant_extend_model_state_classmethods(AscendKimiK3ForConditionalGeneration)
