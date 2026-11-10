@@ -187,6 +187,33 @@ class TestRecurrentLeapQuant(unittest.TestCase):
         self.assertLess((o - ref_o).abs().max().item(), 2e-4)
         self.assertLess((w - ref_s).abs().max().item(), 2e-4)
 
+    def test_null_row_steady_path(self):
+        """w_row = -1 (NULL request): zero state in, no workspace write."""
+        torch.manual_seed(24)
+        B, T, H, HV, V, K = 2, 1, 2, 2, 64, 64
+        scale = K**-0.5
+        q = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.float32)
+        k = torch.randn(B, T, H, K, device=DEVICE, dtype=torch.float32)
+        v = torch.randn(B, T, HV, V, device=DEVICE, dtype=torch.float32)
+        g = -0.05 * torch.rand(B, T, HV, device=DEVICE, dtype=torch.float32) - 0.01
+        beta = torch.rand(B, T, HV, device=DEVICE, dtype=torch.float32)
+        s0 = 0.3 * torch.randn(1, HV, V, K, device=DEVICE, dtype=torch.float32)
+
+        w = torch.zeros(2, HV, V, K, device=DEVICE, dtype=torch.float32)
+        w[1] = s0[0]
+        rows = torch.tensor([-1, 1], device=DEVICE, dtype=torch.int64)
+        o = recurrent_gdn_leapquant(
+            q, k, v, g, beta, scale=scale, w_in=w, w_out=w, w_rows=rows
+        )
+        torch.npu.synchronize()
+        ref_o, ref_s = _reference(
+            torch.cat([torch.zeros(1, HV, V, K, device=DEVICE), s0]), q, k, v, g, beta, scale
+        )
+        self.assertLess((o - ref_o).abs().max().item(), 2e-4)
+        # row -1 never written (row 0 untouched = still zero), row 1 updated
+        self.assertEqual(w[0].abs().max().item(), 0.0)
+        self.assertLess((w[1] - ref_s[1]).abs().max().item(), 2e-4)
+
     def test_validation(self):
         q, k, v, g, beta, s0, scale = self._make_case(1, 1, 2, 2, 64, 64)
         with self.assertRaises(ValueError):

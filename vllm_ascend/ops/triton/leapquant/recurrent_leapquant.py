@@ -30,8 +30,9 @@ K cols) exactly matching the payload field geometry (codes ``[V, K]``,
 
 Modes (wrapper): steady-state rows pass ``w_in`` (fp32 W workspace); a cold
 row (fresh window / resume) omits it and the kernel reconstructs the
-initial tile from the payload checkpoint (``USE_PAYLOAD_INIT``). NULL slots
-(``slot_id <= 0``) start from a zero state. The window-boundary re-encode
+initial tile from the payload checkpoint (``USE_PAYLOAD_INIT``). NULL rows
+/ slots (sentinel ``-1``, the ``ssm_state_indices`` convention) run on a
+zero state and skip the workspace write. The window-boundary re-encode
 stays host-side as the M3.2 split launches; fusing it in-kernel is a later
 optimization, not a correctness need.
 
@@ -100,14 +101,15 @@ def _recurrent_gdn_leapquant_kernel(
     o_k = i_k * BK + tl.arange(0, BK)
     offs_r = tl.arange(0, 16)
 
+    # workspace row id; NULL rows (sentinel -1, matching ssm_state_indices)
+    # skip the workspace read/write entirely — the recurrence still runs on
+    # a zero state so the output row stays well-defined.
+    row = tl.load(w_row_ptr + i_n).to(tl.int64)
+
     if USE_PAYLOAD_INIT:
         # ---- S0 = q^T u + codes * (s_k/127) * s_v  (eq. 8-9 readout) ----
         slot = tl.load(slot_ptr + i_n).to(tl.int64)
         if slot < 0:
-            # NULL slot (sentinel -1, matching ssm_state_indices; slot 0 is
-            # a VALID pool row): zero initial state.  Stock kernels skip the
-            # program entirely; here the recurrence still runs so the output
-            # row is well-defined.
             b_h = tl.zeros([BV, BK], dtype=tl.float32)
         else:
             codes = tl.load(
@@ -134,11 +136,13 @@ def _recurrent_gdn_leapquant_kernel(
                 u_col = tl.sum(tl.where(offs_r[None, :] == r, u_plane, 0.0), axis=1)
                 b_h += q_col[:, None] * u_col[None, :]
     else:
-        row = tl.load(w_row_ptr + i_n).to(tl.int64)
-        b_h = tl.load(
-            w_in_ptr + row * stride_wi_row + i_hv * stride_wi_head
-            + o_v[:, None] * stride_wi_v + o_k[None, :] * stride_wi_k
-        )
+        if row < 0:
+            b_h = tl.zeros([BV, BK], dtype=tl.float32)
+        else:
+            b_h = tl.load(
+                w_in_ptr + row * stride_wi_row + i_hv * stride_wi_head
+                + o_v[:, None] * stride_wi_v + o_k[None, :] * stride_wi_k
+            )
 
     # ---- token loop: the stock gated-delta-rule recurrence ---------------
     for i_t in range(0, T):
@@ -151,8 +155,8 @@ def _recurrent_gdn_leapquant_kernel(
         b_v = tl.load(
             v_ptr + i_n * stride_vb + i_t * stride_vt + i_hv * stride_vh + o_v
         ).to(tl.float32)
-        b_g = tl.load(g_ptr + i_n * stride_gb + i_t * stride_gt + i_hv * stride_gh)
-        b_beta = tl.load(beta_ptr + i_n * stride_gb + i_t * stride_gt + i_hv * stride_gh)
+        b_g = tl.load(g_ptr + i_n * stride_gb + i_t * stride_gt + i_hv * stride_gh).to(tl.float32)
+        b_beta = tl.load(beta_ptr + i_n * stride_gb + i_t * stride_gt + i_hv * stride_gh).to(tl.float32)
 
         # scalar decay (GDN): whole-state gate
         b_h *= tl.exp(b_g)
@@ -169,12 +173,12 @@ def _recurrent_gdn_leapquant_kernel(
         )
 
     # ---- final state -> W workspace row ----------------------------------
-    row = tl.load(w_row_ptr + i_n).to(tl.int64)
-    tl.store(
-        w_out_ptr + row * stride_wo_row + i_hv * stride_wo_head
-        + o_v[:, None] * stride_wo_v + o_k[None, :] * stride_wo_k,
-        b_h,
-    )
+    if row >= 0:
+        tl.store(
+            w_out_ptr + row * stride_wo_row + i_hv * stride_wo_head
+            + o_v[:, None] * stride_wo_v + o_k[None, :] * stride_wo_k,
+            b_h,
+        )
 
 
 def recurrent_gdn_leapquant(

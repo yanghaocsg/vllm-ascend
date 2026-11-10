@@ -71,6 +71,48 @@ def _run_trajectory(flush: bool) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.stack(outputs), state
 
 
+def _run_trajectory_triton(flush: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same trajectory on the M3.4 triton kernel (the gdn.py decode
+    replacement): identical inputs, state pool updated in place."""
+    from vllm_ascend.ops.triton.leapquant import recurrent_gdn_leapquant
+
+    torch.manual_seed(42)
+    device = torch.device("npu:0")
+    torch.npu.set_device(device)
+
+    q = torch.randn(STEPS, SEQS, H, DK, device=device, dtype=torch.float32)
+    k = torch.randn(STEPS, SEQS, H, DK, device=device, dtype=torch.float32)
+    v = torch.randn(STEPS, SEQS, H, DV, device=device, dtype=torch.float32)
+    g = -torch.rand(STEPS, SEQS, H, device=device, dtype=torch.float32) * 0.1
+    beta = (torch.rand(STEPS, SEQS, H, device=device, dtype=torch.float32) * 0.5 + 0.5).to(torch.bfloat16)
+    q_n = torch.nn.functional.normalize(q, dim=-1).to(torch.bfloat16)
+    k_n = torch.nn.functional.normalize(k, dim=-1).to(torch.bfloat16)
+
+    state = torch.zeros(SLOTS, H, DV, DK, device=device, dtype=torch.float32)
+    indices = torch.tensor([1, 3], device=device, dtype=torch.int64)
+    seq_lens = torch.zeros(SEQS, dtype=torch.int64)
+    config = LeapQuantConfig(enabled=True, window=WINDOW, compensator_tokens=4)
+    outputs = []
+
+    for t in range(STEPS):
+        out = recurrent_gdn_leapquant(
+            q_n[t][:, None].contiguous(),
+            k_n[t][:, None].contiguous(),
+            v[t].to(torch.bfloat16)[:, None].contiguous(),
+            g[t][:, None].contiguous(),
+            beta[t][:, None].contiguous(),
+            scale=DK**-0.5,
+            w_in=state,
+            w_out=state,
+            w_rows=indices,
+        )
+        outputs.append(out[:, 0].detach().clone())
+        seq_lens += 1
+        if flush:
+            leapquant_flush_state_rows(state, indices, seq_lens, config=config)
+    return torch.stack(outputs), state
+
+
 class TestLeapQuantGDNIntegration(unittest.TestCase):
     # Hold the reference tensors as class attributes: keeps the allocation
     # alive for the comparison and avoids interleaved NPU-memory reuse.
@@ -91,6 +133,28 @@ class TestLeapQuantGDNIntegration(unittest.TestCase):
         self.assertLess(out_rel, 0.05, f"output drift too large: {out_rel}")
         self.assertLess(state_rel, 0.05, f"state drift too large: {state_rel}")
         # Untouched slots must remain exactly zero.
+        self.assertEqual(int(flushed_state[[0, 2, 4, 5, 6, 7]].abs().sum()), 0)
+
+    def test_triton_decode_matches_ascendc(self):
+        """M3.4: the triton decode replacement must reproduce the AscendC
+        trajectory on the same fp32 pool (bf16 input rounding aside)."""
+        tri_out, tri_state = _run_trajectory_triton(flush=False)
+        out_rel = ((tri_out - self.reference_output).norm() / self.reference_output.norm()).item()
+        state_rel = ((tri_state - self.reference_state).norm() / self.reference_state.norm()).item()
+        self.assertLess(out_rel, 0.02, f"triton vs AscendC output: {out_rel}")
+        self.assertLess(state_rel, 0.02, f"triton vs AscendC state: {state_rel}")
+        # Untouched slots must remain exactly zero.
+        self.assertEqual(int(tri_state[[0, 2, 4, 5, 6, 7]].abs().sum()), 0)
+
+    def test_triton_flushed_trajectory(self):
+        """Triton decode + window flush stays within the same envelope as
+        the AscendC flushed trajectory."""
+        flushed_output, flushed_state = _run_trajectory_triton(flush=True)
+        ref_out, ref_state = _run_trajectory_triton(flush=False)
+        out_rel = ((flushed_output - ref_out).norm() / ref_out.norm()).item()
+        state_rel = ((flushed_state - ref_state).norm() / ref_state.norm()).item()
+        self.assertLess(out_rel, 0.05, f"output drift too large: {out_rel}")
+        self.assertLess(state_rel, 0.05, f"state drift too large: {state_rel}")
         self.assertEqual(int(flushed_state[[0, 2, 4, 5, 6, 7]].abs().sum()), 0)
 
 

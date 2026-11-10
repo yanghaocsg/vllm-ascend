@@ -51,6 +51,7 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_varlen, extract_last_width
 from vllm_ascend.ops.triton.mamba.state_index import gather_ssm_states, scatter_ssm_states_
+from vllm_ascend.ops.triton.leapquant import recurrent_gdn_leapquant
 from vllm_ascend.quantization.methods.mamba_state.leapquant import (
     leapquant_config_or_none,
     leapquant_flush_state_rows,
@@ -211,6 +212,40 @@ def _split_head_first_conv_output(
     """
     q, k, v = output.split((num_k_heads, num_k_heads, num_v_heads), dim=0)
     return tuple(part.transpose(0, 1).unsqueeze(0) for part in (q, k, v))
+
+
+def _leapquant_recurrent_decode(
+    ssm_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """LeapQuant triton decode step (RFC vllm-ascend#21097, M3.4).
+
+    Drop-in replacement for the fla_npu AscendC ``recurrent_gated_delta_rule``
+    decode call: same gated-delta-rule math on the same fp32
+    ``[slots, HV, V, K]`` pool (in-place row update, NULL ``-1`` rows
+    skipped), and the substrate for the M3.4 payload checkpoint readout.
+    Decode emits one token per request, so the flattened [T] token axis maps
+    1:1 onto the kernel's [B] batch axis. Shapes: q/k ``[1, T, H, K]``
+    (l2norm applied by the caller), v ``[1, T, HV, V]``, g/beta
+    ``[1, T, HV]``; returns ``[1, T, HV, V]``.
+    """
+    return recurrent_gdn_leapquant(
+        q.squeeze(0).unsqueeze(1),
+        k.squeeze(0).unsqueeze(1),
+        v.squeeze(0).unsqueeze(1),
+        g.squeeze(0).unsqueeze(1),
+        beta.squeeze(0).unsqueeze(1),
+        scale=scale,
+        w_in=ssm_state,
+        w_out=ssm_state,
+        w_rows=state_indices,
+    ).squeeze(1).unsqueeze(0)
 
 
 def _rearrange_decode_qkv(
@@ -748,6 +783,20 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         num_decode_tokens = attn_metadata.num_decode_tokens
 
+        # 2.0: LeapQuant triton decode (RFC vllm-ascend#21097, M3.4). Under
+        # the triton kernel backend the non-spec decode step routes through
+        # the payload-capable triton kernel instead of the fla_npu AscendC
+        # op: identical gated-delta-rule math on the same fp32
+        # [slots, HV, V, K] pool (in-place row update, NULL rows skipped),
+        # and the substrate for the M3.4 payload checkpoint readout. Spec
+        # paths stay on the AscendC op (LeapQuant rejects spec configs).
+        leapquant_config = leapquant_config_or_none()
+        leapquant_triton_decode = (
+            leapquant_config is not None
+            and leapquant_config.kernel_backend == "triton"
+            and ssm_state.dtype == torch.float32
+        )
+
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
             query_spec = l2norm_fwd(query_spec)
@@ -804,20 +853,34 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_decode = l2norm_fwd(query_decode.contiguous())
             key_decode = l2norm_fwd(key_decode.contiguous())
-            core_attn_out_decode = recurrent_gated_delta_rule(
-                query_decode.squeeze(0),
-                key_decode.squeeze(0),
-                value_decode.squeeze(0),
-                ssm_state,
-                g=g_non_spec[:, :num_decode_tokens].squeeze(0),
-                beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
-                scale=key_decode.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=_flatten_recurrent_state_indices(
-                    non_spec_state_indices_tensor,
-                    num_decode_tokens,
-                ),
-            ).unsqueeze(0)
+            if leapquant_triton_decode:
+                core_attn_out_decode = _leapquant_recurrent_decode(
+                    ssm_state,
+                    _flatten_recurrent_state_indices(
+                        non_spec_state_indices_tensor, num_decode_tokens
+                    ),
+                    query_decode,
+                    key_decode,
+                    value_decode,
+                    g_non_spec[:, :num_decode_tokens],
+                    beta_non_spec[:, :num_decode_tokens],
+                    key_decode.shape[-1] ** -0.5,
+                )
+            else:
+                core_attn_out_decode = recurrent_gated_delta_rule(
+                    query_decode.squeeze(0),
+                    key_decode.squeeze(0),
+                    value_decode.squeeze(0),
+                    ssm_state,
+                    g=g_non_spec[:, :num_decode_tokens].squeeze(0),
+                    beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
+                    scale=key_decode.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=_flatten_recurrent_state_indices(
+                        non_spec_state_indices_tensor,
+                        num_decode_tokens,
+                    ),
+                ).unsqueeze(0)
         else:
             core_attn_out_decode = None
 
@@ -951,20 +1014,34 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
-            core_attn_out_non_spec = recurrent_gated_delta_rule(
-                query_non_spec.squeeze(0),
-                key_non_spec.squeeze(0),
-                value_non_spec.squeeze(0),
-                ssm_state,
-                g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
-                beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
-                scale=key_non_spec.shape[-1] ** -0.5,
-                actual_seq_lengths=actual_seq_lengths,
-                ssm_state_indices=_flatten_recurrent_state_indices(
-                    non_spec_state_indices_tensor,
-                    num_decode_tokens,
-                ),
-            ).unsqueeze(0)
+            if leapquant_triton_decode:
+                core_attn_out_non_spec = _leapquant_recurrent_decode(
+                    ssm_state,
+                    _flatten_recurrent_state_indices(
+                        non_spec_state_indices_tensor, num_decode_tokens
+                    ),
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    key_non_spec.shape[-1] ** -0.5,
+                )
+            else:
+                core_attn_out_non_spec = recurrent_gated_delta_rule(
+                    query_non_spec.squeeze(0),
+                    key_non_spec.squeeze(0),
+                    value_non_spec.squeeze(0),
+                    ssm_state,
+                    g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                    beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=_flatten_recurrent_state_indices(
+                        non_spec_state_indices_tensor,
+                        num_decode_tokens,
+                    ),
+                ).unsqueeze(0)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
@@ -979,7 +1056,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         # unless leapquant_config is enabled (and spec/PD/FULL-graph are
         # rejected at config validation, so the CPU seq_lens/query_lens
         # attached by the metadata builder are exact here).
-        leapquant_config = leapquant_config_or_none()
         if (
             leapquant_config is not None
             and non_spec_state_indices_tensor is not None
