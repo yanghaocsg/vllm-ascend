@@ -56,6 +56,7 @@ from vllm_ascend.quantization.methods.mamba_state.leapquant import (
     leapquant_config_or_none,
     leapquant_flush_state_rows,
     leapquant_payload_pool_for_layer,
+    leapquant_workspace_for,
     leapquant_payload_state_extension,
 )
 from vllm_ascend.utils import vllm_version_is
@@ -796,6 +797,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             and leapquant_config.kernel_backend == "triton"
             and ssm_state.dtype == torch.float32
         )
+        # M3.4a: shadow fp32 workspace W with the identity slot mapping
+        # (W[slot] mirrors ssm_state[slot]). While the triton decode backend
+        # is active, the decode kernel and the window flush run on W rows
+        # instead of the (possibly page-strided) engine pool; every slot
+        # that prefills this step mirrors its post-scatter row back into W
+        # (§2.3 below), which also heals rows on slot reuse. No host-side
+        # slot->row table is needed and no D2H sync is added.
+        leapquant_state_pool = (
+            leapquant_workspace_for(ssm_state) if leapquant_triton_decode else ssm_state
+        )
 
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None:
@@ -855,7 +866,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_decode = l2norm_fwd(key_decode.contiguous())
             if leapquant_triton_decode:
                 core_attn_out_decode = _leapquant_recurrent_decode(
-                    ssm_state,
+                    leapquant_state_pool,
                     _flatten_recurrent_state_indices(
                         non_spec_state_indices_tensor, num_decode_tokens
                     ),
@@ -1005,6 +1016,24 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     scatter_ssm_states_(ssm_state, prefill_state_indices, final_state)
                 else:
                     ssm_state[prefill_state_indices] = final_state
+            if leapquant_triton_decode:
+                # M3.4a mirror: the prefill kernels above wrote ssm_state rows
+                # (three scatter variants); mirror every prefilled slot into
+                # the shadow pool W. This is also the slot-reuse heal — a new
+                # request's first prefill overwrites the stale shadow row
+                # unconditionally. The gather/scatter helpers read/write only
+                # the selected rows (plain advanced indexing would first
+                # materialize the whole padded pool).
+                _mirror_present = torch.ones(
+                    prefill_state_indices.shape[0],
+                    dtype=torch.bool,
+                    device=prefill_state_indices.device,
+                )
+                scatter_ssm_states_(
+                    leapquant_state_pool,
+                    prefill_state_indices,
+                    gather_ssm_states(ssm_state, prefill_state_indices, _mirror_present),
+                )
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],
@@ -1016,7 +1045,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_non_spec = l2norm_fwd(key_non_spec)
             if leapquant_triton_decode:
                 core_attn_out_non_spec = _leapquant_recurrent_decode(
-                    ssm_state,
+                    leapquant_state_pool,
                     _flatten_recurrent_state_indices(
                         non_spec_state_indices_tensor, num_decode_tokens
                     ),
@@ -1067,7 +1096,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 else None
             )
             leapquant_flush_state_rows(
-                ssm_state,
+                leapquant_state_pool,
                 non_spec_state_indices_tensor,
                 leapquant_seq_lens,
                 config=leapquant_config,

@@ -28,6 +28,9 @@ from vllm_ascend.quantization.methods.mamba_state.leapquant.state import (
     reconstruct_state,
     start_basis,
 )
+from vllm_ascend.quantization.methods.mamba_state.leapquant.workspace import (
+    leapquant_workspace_for,
+)
 
 __all__ = [
     "LeapQuantPayloadPool",
@@ -46,4 +49,5 @@ __all__ = [
     "quantize_residual",
     "reconstruct_state",
     "start_basis",
+    "leapquant_workspace_for",
 ]
