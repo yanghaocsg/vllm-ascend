@@ -36,11 +36,20 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence im
 )
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNHostMetadataBackend
 from vllm_ascend.ops.kda import run_chunk_kda, run_recurrent_kda
+from vllm_ascend.ops.triton.leapquant import (
+    kda_expand_gate,
+    recurrent_kda_leapquant,
+)
+from vllm_ascend.ops.triton.mamba.state_index import (
+    gather_ssm_states,
+    scatter_ssm_states_,
+)
 from vllm_ascend.quantization.methods.mamba_state.leapquant import (
     leapquant_config_or_none,
     leapquant_flush_state_rows,
     leapquant_payload_pool_for_layer,
     leapquant_payload_state_extension,
+    leapquant_workspace_for,
 )
 from vllm_ascend.quantization.methods.w4a8.w4a8_mxfp4 import (
     AscendW4A8MXFPDynamicLinearMethod,
@@ -502,6 +511,50 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             num_accepted_tokens=num_accepted_tokens,
         )
 
+    def _leapquant_kda_recurrent(
+        self,
+        state_pool: torch.Tensor,
+        state_indices: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> torch.Tensor:
+        """LeapQuant triton decode step for KDA (RFC vllm-ascend#21097, M3.4a).
+
+        Drop-in replacement for the fla_npu AscendC ``recurrent_kda`` decode
+        call: the same KDA recurrence — per-K-column decay
+        ``(I − βkk^T)Diag(α)S + βkv^T`` ≡ ``Diag(α)S + βk(v − S^T(α⊙k))^T``
+        — on the W workspace rows instead of the engine pool. The AscendC
+        binary computes the gate (``-exp(A_log)·softplus(a + dt_bias)`` or
+        the ``lower_bound`` safe variant) and the q/k l2norm in-kernel; the
+        binary cannot be modified, so both run host-side here before the
+        triton kernel launch (decode emits one token per request, so the
+        flattened [T] token axis maps 1:1 onto the kernel's [B] batch axis).
+        Shapes: q/k/v ``[1, T, H, K/V]``, raw_gate ``[1, T, H, K]``, beta
+        ``[1, T, HV]`` (sigmoid applied); returns ``[1, T, HV, V]``.
+        """
+        # FLA's import-time capability queries can create an unwanted NPU
+        # context before the worker selects its device — same lazy import as
+        # run_chunk_kda.
+        from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
+
+        q = l2norm_fwd(q.contiguous())
+        k = l2norm_fwd(k.contiguous())
+        g = kda_expand_gate(raw_gate, self.A_log, self.dt_bias, self.gate_lower_bound)
+        return recurrent_kda_leapquant(
+            q.squeeze(0).unsqueeze(1),
+            k.squeeze(0).unsqueeze(1),
+            v.squeeze(0).unsqueeze(1),
+            g.squeeze(0).unsqueeze(1),
+            beta.squeeze(0).unsqueeze(1),
+            scale=q.shape[-1] ** -0.5,
+            w_in=state_pool,
+            w_out=state_pool,
+            w_rows=state_indices,
+        ).squeeze(1).unsqueeze(0)
+
     def _run_prefill(
         self,
         q: torch.Tensor,
@@ -595,6 +648,22 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # bound kv-cache list (M3.2b); index instead of unpacking.
         conv_state, recurrent_state = self.kv_cache[0], self.kv_cache[1]
         conv_weights_t = self.get_parameter(_PACKED_CONV_WEIGHT_NAME)
+        # LeapQuant triton decode (RFC vllm-ascend#21097, M3.4a): under the
+        # triton kernel backend the non-spec decode step routes through the
+        # payload-capable triton kernel instead of the fla_npu AscendC op,
+        # running on the shadow fp32 workspace W (identity slot mapping,
+        # W[slot] mirrors recurrent_state[slot]); the window flush and the
+        # prefill mirror below keep both pools coherent. Spec paths stay on
+        # the AscendC op (LeapQuant rejects spec configs at validation).
+        leapquant_config = leapquant_config_or_none()
+        leapquant_triton_decode = (
+            leapquant_config is not None
+            and leapquant_config.kernel_backend == "triton"
+            and recurrent_state.dtype == torch.float32
+        )
+        leapquant_state_pool = (
+            leapquant_workspace_for(recurrent_state) if leapquant_triton_decode else recurrent_state
+        )
         spec_masks = attn_metadata.spec_sequence_masks
         spec_token_indices = attn_metadata.spec_token_indx
         non_spec_token_indices = attn_metadata.non_spec_token_indx
@@ -694,16 +763,27 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             if split_non_spec:
                 assert attn_metadata.non_spec_query_start_loc is not None
                 assert attn_metadata.non_spec_state_indices_tensor is not None
-                core_decode = self._run_recurrent(
-                    q_non_spec[:, :num_decode_tokens],
-                    k_non_spec[:, :num_decode_tokens],
-                    v_non_spec[:, :num_decode_tokens],
-                    raw_gate_non_spec[:, :num_decode_tokens],
-                    beta_non_spec[:, :num_decode_tokens],
-                    recurrent_state,
-                    attn_metadata.non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    attn_metadata.non_spec_state_indices_tensor[: attn_metadata.num_decodes],
-                )
+                if leapquant_triton_decode:
+                    core_decode = self._leapquant_kda_recurrent(
+                        leapquant_state_pool,
+                        attn_metadata.non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                        q_non_spec[:, :num_decode_tokens],
+                        k_non_spec[:, :num_decode_tokens],
+                        v_non_spec[:, :num_decode_tokens],
+                        raw_gate_non_spec[:, :num_decode_tokens],
+                        beta_non_spec[:, :num_decode_tokens],
+                    )
+                else:
+                    core_decode = self._run_recurrent(
+                        q_non_spec[:, :num_decode_tokens],
+                        k_non_spec[:, :num_decode_tokens],
+                        v_non_spec[:, :num_decode_tokens],
+                        raw_gate_non_spec[:, :num_decode_tokens],
+                        beta_non_spec[:, :num_decode_tokens],
+                        recurrent_state,
+                        attn_metadata.non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                        attn_metadata.non_spec_state_indices_tensor[: attn_metadata.num_decodes],
+                    )
 
             if attn_metadata.num_prefills > 0:
                 if split_non_spec:
@@ -731,19 +811,52 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
                 core_non_spec = (
                     torch.cat((core_decode, core_prefill), dim=1) if core_decode is not None else core_prefill
                 )
+                if leapquant_triton_decode:
+                    # M3.4a mirror: the chunked prefill above scattered
+                    # final states into recurrent_state rows; mirror every
+                    # prefilled slot into the shadow pool W. This is also the
+                    # slot-reuse heal — a new request's first prefill
+                    # overwrites the stale shadow row unconditionally. The
+                    # gather/scatter helpers read/write only the selected
+                    # rows (plain advanced indexing would first materialize
+                    # the whole padded pool).
+                    assert attn_metadata.prefill_state_indices is not None
+                    _mirror_present = torch.ones(
+                        attn_metadata.prefill_state_indices.shape[0],
+                        dtype=torch.bool,
+                        device=attn_metadata.prefill_state_indices.device,
+                    )
+                    scatter_ssm_states_(
+                        leapquant_state_pool,
+                        attn_metadata.prefill_state_indices,
+                        gather_ssm_states(
+                            recurrent_state, attn_metadata.prefill_state_indices, _mirror_present
+                        ),
+                    )
             elif attn_metadata.num_decodes > 0:
                 assert attn_metadata.non_spec_query_start_loc is not None
                 assert attn_metadata.non_spec_state_indices_tensor is not None
-                core_non_spec = self._run_recurrent(
-                    q_non_spec,
-                    k_non_spec,
-                    v_non_spec,
-                    raw_gate_non_spec,
-                    beta_non_spec,
-                    recurrent_state,
-                    attn_metadata.non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
-                    attn_metadata.non_spec_state_indices_tensor,
-                )
+                if leapquant_triton_decode:
+                    core_non_spec = self._leapquant_kda_recurrent(
+                        leapquant_state_pool,
+                        attn_metadata.non_spec_state_indices_tensor,
+                        q_non_spec,
+                        k_non_spec,
+                        v_non_spec,
+                        raw_gate_non_spec,
+                        beta_non_spec,
+                    )
+                else:
+                    core_non_spec = self._run_recurrent(
+                        q_non_spec,
+                        k_non_spec,
+                        v_non_spec,
+                        raw_gate_non_spec,
+                        beta_non_spec,
+                        recurrent_state,
+                        attn_metadata.non_spec_query_start_loc[: attn_metadata.num_decodes + 1],
+                        attn_metadata.non_spec_state_indices_tensor,
+                    )
 
         if core_spec is None and core_non_spec is None:
             # Idle DP dummy runs carry graph-shaped metadata with no live work.
@@ -757,8 +870,10 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
         # state of every request whose post-step token count (== seq_len) is
         # an exact multiple of the window. No-op unless leapquant_config is
         # enabled (spec decode / PD / FULL cudagraphs are rejected at config
-        # validation).
-        leapquant_config = leapquant_config_or_none()
+        # validation). Under the triton decode backend the flush runs on the
+        # shadow W pool (the running state the decode kernel updates), same
+        # as the GDN path; dual-write keeps recurrent_state correct until
+        # the payload-readout milestone drops it.
         if (
             leapquant_config is not None
             and attn_metadata.non_spec_state_indices_tensor is not None
@@ -775,7 +890,7 @@ class AscendKimiK3DeltaAttention(KimiK3DeltaAttention):
             # the flush only — prefill keeps using it.
             use_state_copy = not leapquant_config.payload_pool
             leapquant_flush_state_rows(
-                recurrent_state,
+                leapquant_state_pool if leapquant_triton_decode else recurrent_state,
                 attn_metadata.non_spec_state_indices_tensor,
                 leapquant_seq_lens,
                 config=leapquant_config,
