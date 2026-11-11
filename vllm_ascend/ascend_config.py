@@ -321,11 +321,11 @@ class LeapQuantConfig:
 
     @model_validator(mode="after")
     def _validate(self):
-        if self.window not in (8, 16, 32, 64):
+        if self.window not in (1, 8, 16, 32, 64):
             raise ValueError(f"leapquant_config.window must be one of (8, 16, 32, 64); got {self.window}")
-        if not 1 <= self.compensator_tokens <= 8:
+        if not 0 <= self.compensator_tokens <= 8:
             raise ValueError(
-                f"leapquant_config.compensator_tokens must be between 1 and 8; got {self.compensator_tokens}"
+                f"leapquant_config.compensator_tokens must be between 0 and 8; got {self.compensator_tokens}"
             )
         if self.bits != 8:
             raise ValueError(f"leapquant_config.bits supports only 8 in this milestone; got {self.bits}")

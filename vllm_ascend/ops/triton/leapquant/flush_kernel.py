@@ -389,7 +389,7 @@ def leapquant_flush_triton(
             and head strides are allowed.
         slot_ids: 1D int32/int64 tensor of slot rows whose sequences just
             crossed a window boundary.
-        compensator_tokens: rank ``R`` of the compensator subspace (1..16).
+        compensator_tokens: rank ``R`` of the compensator subspace (0..16; 0 = smoothing-only int8).
         payload: ``LeapQuantPayloadPool`` whose geometry must match
             ``state`` and ``compensator_tokens``.
         rewrite_state: payload-mode fp32 rewrite flag (see above); must
@@ -410,8 +410,8 @@ def leapquant_flush_triton(
     _, heads, v_dim, k_dim = state.shape
     if v_dim & (v_dim - 1) or k_dim & (k_dim - 1):
         raise ValueError(f"V/K must be powers of two, got V={v_dim}, K={k_dim}")
-    if not 1 <= compensator_tokens <= _LEAPQUANT_RANK_PAD:
-        raise ValueError(f"compensator_tokens must be 1..16, got {compensator_tokens}")
+    if not 0 <= compensator_tokens <= _LEAPQUANT_RANK_PAD:
+        raise ValueError(f"compensator_tokens must be 0..16, got {compensator_tokens}")
     if slot_ids.ndim != 1 or slot_ids.numel() == 0:
         raise ValueError("slot_ids must be a non-empty 1D tensor")
     if slot_ids.device != state.device:
